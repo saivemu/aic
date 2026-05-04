@@ -27,7 +27,7 @@ import draccus
 from pathlib import Path
 from typing import Callable, Dict, Any, List
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Vector3
+from geometry_msgs.msg import Twist, Vector3, Pose, Point, Quaternion
 
 from aic_model.policy import (
     GetObservationCallback,
@@ -52,6 +52,13 @@ from huggingface_hub import snapshot_download
 
 
 class RunACT(Policy):
+    # Diagnostic: scale action before publishing.
+    ACTION_SCALE = 4.0
+    # When True, integrate the velocity action into a position target and publish
+    # via MODE_POSITION (set_pose_target). When False, publish raw scaled velocity.
+    USE_POSITION_MODE = True
+    LOOP_DT = 0.25  # seconds
+
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -268,23 +275,37 @@ class RunACT(Policy):
             # 3. Un-normalize Action
             # Formula: (norm * std) + mean
             raw_action_tensor = (normalized_action * self.action_std) + self.action_mean
+            scaled_action_tensor = raw_action_tensor * self.ACTION_SCALE
 
             # 4. Extract and Command
             # raw_action_tensor is [1, 7], taking [0] gives vector of 7
-            action = raw_action_tensor[0].cpu().numpy()
+            raw_action = raw_action_tensor[0].cpu().numpy()
+            action = scaled_action_tensor[0].cpu().numpy()
 
-            self.get_logger().info(f"Action: {action}")
-
-            twist = Twist(
-                linear=Vector3(
-                    x=float(action[0]), y=float(action[1]), z=float(action[2])
-                ),
-                angular=Vector3(
-                    x=float(action[3]), y=float(action[4]), z=float(action[5])
-                ),
+            self.get_logger().info(
+                f"raw={raw_action[:6].round(5).tolist()} "
+                f"scaled(x{self.ACTION_SCALE})={action[:6].round(5).tolist()} "
+                f"mode={'POS' if self.USE_POSITION_MODE else 'VEL'}"
             )
-            motion_update = self.set_cartesian_twist_target(twist)
-            move_robot(motion_update=motion_update)
+
+            if self.USE_POSITION_MODE:
+                target_pose = self._integrate_action_to_pose(
+                    observation_msg.controller_state.tcp_pose,
+                    action[:6],
+                    self.LOOP_DT,
+                )
+                self.set_pose_target(move_robot=move_robot, pose=target_pose)
+            else:
+                twist = Twist(
+                    linear=Vector3(
+                        x=float(action[0]), y=float(action[1]), z=float(action[2])
+                    ),
+                    angular=Vector3(
+                        x=float(action[3]), y=float(action[4]), z=float(action[5])
+                    ),
+                )
+                motion_update = self.set_cartesian_twist_target(twist)
+                move_robot(motion_update=motion_update)
             send_feedback("in progress...")
 
             # Maintain control rate (approx 4Hz loop = 0.25s sleep)
@@ -293,6 +314,66 @@ class RunACT(Policy):
 
         self.get_logger().info("RunACT.insert_cable() exiting...")
         return True
+
+    @staticmethod
+    def _quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+        """Hamilton product, both inputs (w, x, y, z)."""
+        w1, x1, y1, z1 = q1
+        w2, x2, y2, z2 = q2
+        return np.array(
+            [
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+            ]
+        )
+
+    def _integrate_action_to_pose(
+        self, current_pose: Pose, action6: np.ndarray, dt: float
+    ) -> Pose:
+        """Treat action[:3] as linear velocity (m/s) and action[3:6] as angular
+        velocity (rad/s) in base frame. Integrate over dt, compose onto current
+        TCP pose, and return the resulting target Pose."""
+        # Linear: target = current + v * dt
+        target_x = current_pose.position.x + float(action6[0]) * dt
+        target_y = current_pose.position.y + float(action6[1]) * dt
+        target_z = current_pose.position.z + float(action6[2]) * dt
+
+        # Angular: rotation vector = omega * dt -> quaternion -> compose
+        omega_dt = np.asarray(action6[3:6], dtype=np.float64) * dt
+        angle = float(np.linalg.norm(omega_dt))
+        if angle < 1e-9:
+            q_delta = np.array([1.0, 0.0, 0.0, 0.0])
+        else:
+            axis = omega_dt / angle
+            half = angle / 2.0
+            q_delta = np.array(
+                [np.cos(half), *(axis * np.sin(half))], dtype=np.float64
+            )
+        q_curr = np.array(
+            [
+                current_pose.orientation.w,
+                current_pose.orientation.x,
+                current_pose.orientation.y,
+                current_pose.orientation.z,
+            ],
+            dtype=np.float64,
+        )
+        # World-frame angular velocity → left-multiply
+        q_new = self._quat_mul(q_delta, q_curr)
+        # Normalize defensively
+        q_new = q_new / max(np.linalg.norm(q_new), 1e-9)
+
+        return Pose(
+            position=Point(x=float(target_x), y=float(target_y), z=float(target_z)),
+            orientation=Quaternion(
+                w=float(q_new[0]),
+                x=float(q_new[1]),
+                y=float(q_new[2]),
+                z=float(q_new[3]),
+            ),
+        )
 
     def set_cartesian_twist_target(self, twist: Twist, frame_id: str = "base_link"):
         motion_update_msg = MotionUpdate()

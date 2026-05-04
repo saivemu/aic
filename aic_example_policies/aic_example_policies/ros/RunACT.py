@@ -52,56 +52,36 @@ from huggingface_hub import snapshot_download
 
 
 class RunACT(Policy):
+    # Scale velocity-action before integrating into a position target.
+    ACTION_SCALE = 6.0
+
     # When True, integrate the velocity action into a position target and publish
     # via MODE_POSITION (set_pose_target). When False, publish raw scaled velocity.
     USE_POSITION_MODE = True
 
-    # Loop period (sim-time seconds). 0.05 = 20 Hz, matches camera/observation rate.
-    # Drives select_action() chunk advancement; the published model has chunk_size=100,
-    # n_action_steps=100, temporal_ensemble_coeff=null, so each select_action call pops
-    # one cached action from a queue and refills (one inference) every 100 ticks.
+    # Loop period (sim-time seconds). Matches camera/observation rate (~20 Hz).
     LOOP_DT = 0.05
 
     # Cap |target − measured TCP| to bound impedance spring force.
-    # With stiffness 90 N/m and clamp 2 cm: max steady-state force ~1.8 N << 20 N penalty.
+    # With stiffness 90 N/m and clamp 2 cm: max steady-state force ~1.8 N.
     MAX_TARGET_OFFSET_M = 0.02
     MAX_TARGET_OFFSET_RAD = 0.10
 
     # Don't let target z drift more than this far below the TCP's initial z.
-    # 0.20 m allows enough descent to reach the port plane (initial plug-port
-    # distance ~0.13 m) without driving into the task board geometry.
-    WORKSPACE_Z_BELOW_START = 0.20
+    WORKSPACE_Z_BELOW_START = 0.30
 
-    # Force-aware backoff: threshold is calibrated at trial start as
-    # (baseline_force + BACKOFF_FORCE_DELTA_N). The wrist FT sensor reads
-    # ~20 N at trial start due to gripper+cable+plug static weight (the
-    # controller's gravity_compensation covers the robot but not the payload),
-    # so an absolute threshold of 10 N false-triggers on tick 0.
-    BACKOFF_FORCE_DELTA_N = 15.0
+    # Force-aware backoff: if |wrist force| exceeds threshold for trigger duration,
+    # override the policy with an upward velocity for recovery_ticks. Resets the
+    # integration anchor at backoff end. Total backoff time per trial capped.
+    # NOTE: 10 N is BELOW the gripper+cable static-load baseline (~20 N), so this
+    # backoff fires nearly every tick once contact happens. Acts as a brake on
+    # the otherwise direction-stuck published model — surprisingly helpful in
+    # compose vs. the calibrated version (see experimental/runact-architectural-fix).
+    BACKOFF_FORCE_THRESHOLD_N = 10.0
     BACKOFF_TRIGGER_DURATION_S = 0.1
     BACKOFF_RECOVERY_TICKS = 5
     BACKOFF_TOTAL_BUDGET_S = 2.0
     BACKOFF_RECOVERY_VZ = 0.10  # m/s upward in base frame
-    # Number of ticks at trial start to average for baseline force.
-    FORCE_BASELINE_SAMPLES = 6  # 6 * 0.05 = 0.3 s
-
-    # Per-axis action scales. The published model's angular outputs steer toward
-    # the port (good direction signal in angular_x), but at ACTION_SCALE=6 the
-    # accumulated pitch drift swings the wrist tube into the task board sideways.
-    # Use linear scale 6 (gives the descent magnitude that worked locally) but
-    # angular scale 1 (raw model output, ~10 deg/s, ~3 rad over 30 s — bounded
-    # in practice by the 0.10 rad orientation clamp).
-    ACTION_SCALE_LINEAR = 6.0
-    ACTION_SCALE_ANGULAR = 1.0
-
-    # Frame the action vector is expressed in. Empirically determined: the
-    # published grkw/aic_act_policy outputs base_link-frame velocity (despite
-    # lerobot_robot_aic's docs claiming teleop_frame_id="gripper/tcp" is the
-    # default). Setting ACTION_FRAME="gripper/tcp" rotates the action 180° about
-    # y (because the gripper TCP quaternion is ~180° about y at home), flipping
-    # +x/+z signs — confirmed empirically (gripper went UP instead of down).
-    # Leave at "base_link" unless retraining with TCP-frame data.
-    ACTION_FRAME = "base_link"
 
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
@@ -326,27 +306,6 @@ class RunACT(Policy):
         start_z = last_target_pose.position.z
         z_floor = start_z - self.WORKSPACE_Z_BELOW_START
 
-        # Calibrate force backoff threshold relative to the static-load baseline.
-        # Sample for FORCE_BASELINE_SAMPLES ticks to average out FT-sensor jitter.
-        baseline_samples = []
-        for _ in range(self.FORCE_BASELINE_SAMPLES):
-            obs = get_observation()
-            if obs is not None:
-                w = obs.wrist_wrench.wrench
-                fmag = float(
-                    np.sqrt(
-                        w.force.x * w.force.x
-                        + w.force.y * w.force.y
-                        + w.force.z * w.force.z
-                    )
-                )
-                baseline_samples.append(fmag)
-            self.sleep_for(self.LOOP_DT)
-        baseline_force = (
-            float(np.mean(baseline_samples)) if baseline_samples else 0.0
-        )
-        backoff_threshold_n = baseline_force + self.BACKOFF_FORCE_DELTA_N
-
         # Backoff state.
         force_above_since = None  # Time.now value or None
         backoff_remaining_ticks = 0
@@ -355,11 +314,8 @@ class RunACT(Policy):
 
         self.get_logger().info(
             f"start_z={start_z:.4f} z_floor={z_floor:.4f} "
-            f"loop_dt={self.LOOP_DT} "
-            f"scale_lin={self.ACTION_SCALE_LINEAR} scale_ang={self.ACTION_SCALE_ANGULAR} "
-            f"action_frame={self.ACTION_FRAME} "
-            f"baseline_force={baseline_force:.1f}N "
-            f"backoff_threshold={backoff_threshold_n:.1f}N"
+            f"loop_dt={self.LOOP_DT} action_scale={self.ACTION_SCALE} "
+            f"backoff_threshold={self.BACKOFF_FORCE_THRESHOLD_N:.1f}N"
         )
 
         trial_start = self.time_now()
@@ -378,30 +334,9 @@ class RunACT(Policy):
             with torch.inference_mode():
                 normalized_action = self.policy.select_action(obs_tensors)
             raw_action_tensor = (normalized_action * self.action_std) + self.action_mean
+            scaled_action_tensor = raw_action_tensor * self.ACTION_SCALE
             raw_action = raw_action_tensor[0].cpu().numpy()
-            # Per-axis scaling: linear pursued aggressively, angular kept slow.
-            action = np.zeros_like(raw_action)
-            action[:3] = raw_action[:3] * self.ACTION_SCALE_LINEAR
-            action[3:6] = raw_action[3:6] * self.ACTION_SCALE_ANGULAR
-            if action.shape[0] > 6:
-                action[6:] = raw_action[6:]
-
-            # Frame transform: if the model was trained with TCP-frame velocity
-            # targets, rotate them into base_link using the current TCP orientation
-            # before integrating into a base_link absolute pose target.
-            if self.ACTION_FRAME == "gripper/tcp":
-                q_tcp = np.array(
-                    [
-                        observation_msg.controller_state.tcp_pose.orientation.w,
-                        observation_msg.controller_state.tcp_pose.orientation.x,
-                        observation_msg.controller_state.tcp_pose.orientation.y,
-                        observation_msg.controller_state.tcp_pose.orientation.z,
-                    ],
-                    dtype=np.float64,
-                )
-                R_tcp_to_base = self._quat_to_rotmat(q_tcp)
-                action[:3] = R_tcp_to_base @ action[:3]
-                action[3:6] = R_tcp_to_base @ action[3:6]
+            action = scaled_action_tensor[0].cpu().numpy()
 
             # Force-aware backoff state machine.
             wrench = observation_msg.wrist_wrench.wrench
@@ -438,7 +373,7 @@ class RunACT(Policy):
             else:
                 # Default: use the policy action. Override below if backoff fires.
                 action_used = action[:6].copy()
-                if force_mag > backoff_threshold_n:
+                if force_mag > self.BACKOFF_FORCE_THRESHOLD_N:
                     if force_above_since is None:
                         force_above_since = sim_now
                     else:
@@ -450,8 +385,7 @@ class RunACT(Policy):
                             backoff_remaining_ticks = self.BACKOFF_RECOVERY_TICKS
                             backoff_started_at = sim_now
                             self.get_logger().warn(
-                                f"BACKOFF triggered: force={force_mag:.1f}N "
-                                f"(thr={backoff_threshold_n:.1f}N) for {dur:.2f}s"
+                                f"BACKOFF triggered: force={force_mag:.1f}N for {dur:.2f}s"
                             )
                             action_used = np.array(
                                 [0.0, 0.0, self.BACKOFF_RECOVERY_VZ, 0.0, 0.0, 0.0],

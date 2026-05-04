@@ -18,6 +18,16 @@ SHELL ["/bin/bash", "-c"]
 RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,target=/ws_aic/src/aic/.pixi/build \
     cd /ws_aic/src/aic && pixi install --locked
 
+# Pre-download model artifacts. The competition network has internal=true,
+# so HuggingFace and torch.hub are unreachable at runtime.
+RUN cd /ws_aic/src/aic && pixi run --as-is python -c "\
+import os; os.environ['HF_HUB_ENABLE_HF_TRANSFER']='1';\
+from huggingface_hub import snapshot_download;\
+snapshot_download(repo_id='grkw/aic_act_policy', allow_patterns=['config.json', 'model.safetensors', '*.safetensors']);\
+import torchvision.models as m;\
+m.resnet18(weights=m.ResNet18_Weights.IMAGENET1K_V1);\
+print('model artifacts baked')"
+
 WORKDIR /ws_aic/src/aic
 COPY --chmod=755 <<"EOF" /entrypoint.sh
 #!/bin/bash
@@ -57,4 +67,4 @@ exec pixi run --as-is ros2 run aic_model aic_model "$@"
 EOF
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.CheatCode", "-p", "use_sim_time:=true"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

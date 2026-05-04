@@ -53,7 +53,7 @@ from huggingface_hub import snapshot_download
 
 class RunACT(Policy):
     # Diagnostic: scale action before publishing.
-    ACTION_SCALE = 4.0
+    ACTION_SCALE = 6.0
     # When True, integrate the velocity action into a position target and publish
     # via MODE_POSITION (set_pose_target). When False, publish raw scaled velocity.
     USE_POSITION_MODE = True

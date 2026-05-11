@@ -89,9 +89,30 @@ class RunACT(Policy):
     def __init__(self, parent_node: Node):
         super().__init__(parent_node)
 
+        # Defer ALL heavy work (imports, model load, CUDA init, normalization
+        # stats) to the first call to insert_cable() via self._setup_policy().
+        # Rationale (see docs/troubleshooting.md "Heavy top-level imports …"):
+        # aic_engine periodically queries lifecycle state on the aic_model node.
+        # If __init__ blocks on slow work (imports, weight load, CUDA init),
+        # those queries time out and the engine may decide the policy has
+        # failed. Putting heavy work in __init__ also runs inside on_configure,
+        # whose 60s budget overlaps with these polling queries.
+        #
+        # __init__ stays tiny so on_configure completes in milliseconds.
+        # First trial pays the load cost (one-time, ~5-10s); subsequent trials
+        # in the same process reuse the loaded model.
+        self._policy_ready = False
+        self._policy = None
+        self.image_scaling = 0.25  # Must match AICRobotAICControllerConfig
+
+    def _setup_policy(self) -> None:
+        """One-time policy + stats load. Idempotent; called from insert_cable."""
+        if self._policy_ready:
+            return
+
         # Deferred heavy imports — promoted to module globals so methods on this
         # class (and any future instances) see them at module scope. Python's
-        # import cache makes second-instance __init__ effectively free.
+        # import cache makes second-instance setup effectively free.
         global torch, np, cv2, draccus, ACTPolicy, ACTConfig, load_file
         import torch  # noqa: F401
         import numpy as np  # noqa: F401
@@ -103,14 +124,11 @@ class RunACT(Policy):
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # -------------------------------------------------------------------------
-        # 1. Configuration & Weights Loading
-        # -------------------------------------------------------------------------
         # Pick the plan at runtime. Both Plan B (ACT, 300 ep, 40k steps) and
-        # Plan C (Diffusion, 300 ep, 40k steps) are baked into the docker image
-        # at /opt/policy_b and /opt/policy_c. The AIC_POLICY_PLAN env var (set in
-        # docker-compose.yaml) selects one without a rebuild. Defaults to Plan B
-        # since it scored 112.90 vs Plan C's 86.03 in compose eval.
+        # Plan C (Diffusion, 300 ep, 40k steps) may be baked into the docker
+        # image at /opt/policy_b and /opt/policy_c. The AIC_POLICY_PLAN env var
+        # (set in docker-compose.yaml) selects one without a rebuild. Defaults
+        # to Plan B since it scored 112.90 vs Plan C's 86.03 in compose eval.
         plan = os.environ.get("AIC_POLICY_PLAN", "b").lower()
         if plan not in ("b", "c"):
             raise ValueError(
@@ -125,10 +143,8 @@ class RunACT(Policy):
             )
 
         # Load Config — dispatch on `type` field. We support ACT (MEAN_STD norm,
-        # n_obs_steps=1, n_action_steps=1+temporal_ensemble) and Diffusion (MIN_MAX
-        # norm, n_obs_steps=2, n_action_steps=8 chunk replay). policy.select_action()
-        # handles each architecture's internal state management; the control loop is
-        # the same for both.
+        # n_obs_steps=1, n_action_steps=1+temporal_ensemble) and Diffusion
+        # (MIN_MAX norm, n_obs_steps=2, n_action_steps=8 chunk replay).
         with open(policy_path / "config.json", "r") as f:
             config_dict = json.load(f)
         policy_type = config_dict.pop("type", "act")
@@ -140,7 +156,6 @@ class RunACT(Policy):
             config = draccus.decode(ACTConfig, config_dict)
             self.policy = ACTPolicy(config)
         elif policy_type == "diffusion":
-            # Lazy-imported to keep cold startup fast for the common Plan B path.
             from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
             from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
             config = draccus.decode(DiffusionConfig, config_dict)
@@ -149,8 +164,7 @@ class RunACT(Policy):
             raise ValueError(f"Unsupported policy type: {policy_type!r}")
         self._policy_type = policy_type
 
-        model_weights_path = policy_path / "model.safetensors"
-        self.policy.load_state_dict(load_file(model_weights_path))
+        self.policy.load_state_dict(load_file(policy_path / "model.safetensors"))
         self.policy.eval()
         self.policy.to(self.device)
 
@@ -159,36 +173,20 @@ class RunACT(Policy):
             f"(state_norm={self._state_norm_mode}, action_norm={self._action_norm_mode})"
         )
 
-        # -------------------------------------------------------------------------
-        # 2. Normalization Stats Loading
-        # -------------------------------------------------------------------------
-        stats_path = (
-            policy_path / "policy_preprocessor_step_3_normalizer_processor.safetensors"
-        )
-        stats = load_file(stats_path)
+        # Normalization stats
+        stats = load_file(policy_path / "policy_preprocessor_step_3_normalizer_processor.safetensors")
 
-        # Helper to extract and shape stats for broadcasting
         def get_stat(key, shape):
             return stats[key].to(self.device).view(*shape)
 
-        # Image Stats (1, 3, 1, 1) for broadcasting against (Batch, Channel, Height, Width)
         self.img_stats = {
-            "left": {
-                "mean": get_stat("observation.images.left_camera.mean", (1, 3, 1, 1)),
-                "std": get_stat("observation.images.left_camera.std", (1, 3, 1, 1)),
-            },
-            "center": {
-                "mean": get_stat("observation.images.center_camera.mean", (1, 3, 1, 1)),
-                "std": get_stat("observation.images.center_camera.std", (1, 3, 1, 1)),
-            },
-            "right": {
-                "mean": get_stat("observation.images.right_camera.mean", (1, 3, 1, 1)),
-                "std": get_stat("observation.images.right_camera.std", (1, 3, 1, 1)),
-            },
+            cam: {
+                "mean": get_stat(f"observation.images.{cam}_camera.mean", (1, 3, 1, 1)),
+                "std": get_stat(f"observation.images.{cam}_camera.std", (1, 3, 1, 1)),
+            }
+            for cam in ("left", "center", "right")
         }
-        print(f"Image stats: {self.img_stats}")
 
-        # Robot State Stats (1, 26) — load mean/std OR min/max depending on mode.
         if self._state_norm_mode == "MEAN_STD":
             self.state_mean = get_stat("observation.state.mean", (1, -1))
             self.state_std = get_stat("observation.state.std", (1, -1))
@@ -198,7 +196,6 @@ class RunACT(Policy):
         else:
             raise ValueError(f"Unsupported state norm mode: {self._state_norm_mode!r}")
 
-        # Action Stats (1, 7) — used for un-normalization at inference output.
         if self._action_norm_mode == "MEAN_STD":
             self.action_mean = get_stat("action.mean", (1, -1))
             self.action_std = get_stat("action.std", (1, -1))
@@ -208,9 +205,7 @@ class RunACT(Policy):
         else:
             raise ValueError(f"Unsupported action norm mode: {self._action_norm_mode!r}")
 
-        # Config
-        self.image_scaling = 0.25  # Must match AICRobotAICControllerConfig
-
+        self._policy_ready = True
         self.get_logger().info("Normalization statistics loaded successfully.")
 
     @staticmethod
@@ -342,7 +337,13 @@ class RunACT(Policy):
           force exceeds 10 N for >100 ms, then resets the anchor.
         - Gripper gravity is already compensated by aic_controller's
           gravity_compensation_action; no feedforward needed in MotionUpdate.
+
+        First-call setup: _setup_policy() runs heavy imports + model load on
+        first call (a few seconds). Subsequent trials reuse the loaded model.
+        Putting the load here instead of __init__ keeps the lifecycle queries
+        responsive during on_configure (see docs/troubleshooting.md).
         """
+        self._setup_policy()
         self.policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
 

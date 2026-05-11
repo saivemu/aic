@@ -138,6 +138,9 @@ LeRobot recording keys:
 
 <!-- TODO: lerobot-record doesn't load the hil processor to handle teleop events (lerobot bug?) -->
 
+For automated training-only demonstrations, see the
+[CheatCode LeRobot dataset collection guide](../../docs/cheatcode_dataset_collection.md).
+
 ### Training
 
 Once you have your LeRobot dataset, you can follow the [LeRobot tutorials](https://huggingface.co/docs/lerobot/en/index) for training.

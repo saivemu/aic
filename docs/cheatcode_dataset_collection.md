@@ -6,6 +6,34 @@ training. Challenge rules allow ground-truth simulator state during training,
 but ground truth is not available during official evaluation, so this data is
 used only to train a policy that consumes normal observations at runtime.
 
+## Current status
+
+This guide is maintained on branch `training/cheatcode-pipeline-clean` in the
+worktree:
+
+```bash
+/home/saivemu/code/aic-worktrees/cheatcode-training-clean
+```
+
+The branch was created from latest `origin/main` and currently contains:
+
+- `record_dataset.py`: passive ROS 2 recorder for `/observations` and
+  `/aic_controller/pose_commands`.
+- `recording_utils.py`: tested pose-target differencing utilities for converting
+  CheatCode `MODE_POSITION` commands into RunACT-style velocity actions.
+- `gen_random_trials.py`: randomized AIC engine config generator.
+- `audit_dataset.py`: offline LeRobot dataset quality summary.
+- `eval_checkpoints.py`: checkpoint imitation-MAE comparison on held-out
+  episodes.
+- `cleanup_engine_bags.sh`: disk cleanup watcher for long eval runs.
+
+Before a large collection run, patch `gen_random_trials.py` to sample both
+`sfp_port_0` and `sfp_port_1`. The qualification docs allow either SFP port,
+and the current generator only targets `sfp_port_0`.
+
+For durable context across Codex sessions, see
+[`cheatcode_training_notes.md`](./cheatcode_training_notes.md).
+
 ## Why this exists
 
 Manual keyboard recording is slow and inconsistent for the cable insertion task.
@@ -21,6 +49,28 @@ CheatCode publishes `MotionUpdate` messages in `MODE_POSITION`, where
 `msg.velocity` is intentionally zero. The recorder therefore differentiates
 consecutive pose targets to synthesize the 7-D action vector expected by RunACT:
 linear velocity xyz, angular velocity xyz, and an unused zero pad.
+
+## Recommended next steps
+
+1. Add SFP port diversity in `gen_random_trials.py` by sampling `sfp_port_0` and
+   `sfp_port_1`.
+2. Generate a smoke config with `20` trials, not a full dataset.
+3. Collect into a separate smoke dataset such as `${HF_USER}/aic_act_smoke`.
+4. Run `audit_dataset.py`.
+5. Visualize several episodes with `lerobot-dataset-viz`.
+6. Only after the smoke dataset looks correct, collect the first serious
+   `300`-episode dataset.
+
+Suggested first target mixture:
+
+- `60-67%` SFP, because qualification has two SFP-style trials.
+- `33-40%` SC, because SC is the generalization trial and should not be
+  under-sampled.
+- Balanced coverage over all five NIC rails.
+- Balanced coverage over both SFP ports after the generator patch.
+- Balanced coverage over both SC rails.
+- Board pose and rail translation coverage across center and boundary values.
+- Grasp jitter around the documented `+/-2 mm` and `+/-0.04 rad` ranges.
 
 ## Collection flow
 
@@ -111,3 +161,28 @@ pixi run python aic_utils/lerobot_robot_aic/scripts/eval_checkpoints.py \
 This reports per-action-dimension MAE in physical units, which is useful for
 choosing the checkpoint that best imitates the CheatCode trajectories before
 running the full scoring pipeline.
+
+## Visualization and upload
+
+Quick local visualization:
+
+```bash
+pixi run lerobot-dataset-viz \
+  --repo-id ${HF_USER}/aic_act_smoke \
+  --root ~/.cache/huggingface/lerobot \
+  --mode local \
+  --episode-index 0
+```
+
+After audit and visual inspection pass, upload the dataset to Hugging Face:
+
+```bash
+pixi run hf auth login
+pixi run hf repo create ${HF_USER}/aic_act_v1 --type dataset --private
+pixi run hf upload ${HF_USER}/aic_act_v1 \
+  ~/.cache/huggingface/lerobot/${HF_USER}/aic_act_v1 \
+  . \
+  --repo-type dataset
+```
+
+Keep datasets private while iterating.

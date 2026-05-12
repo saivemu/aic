@@ -100,7 +100,32 @@ There's also a ~9-pt build-to-build variance even with identical source (112.83 
 **Submission decision:** **Do NOT push a new ECR image tonight.** The shipped `plan-b-v3` scores 112.90 on the cluster; our best rebuild today scores 103.61 in compose. Submitting would replace a known 112.90 with a worst-case ~95-105. Leave v3 shipped; this revert is staged for whenever the source is shipped next (e.g. with a new model).
 
 ### Status of original Plan D dataset-recollection plan
-Shelved. The architectural fix path described above is sufficient — the score problem was control-loop code, not data.
+Shelved at the time of the compose-mode investigation. **Unshelved later the same day** when the user reviewed the replan ([phase_cdef_replan.md](phase_cdef_replan.md)) and chose to bet on fresh data with augmented state (wrench + task one-hot) rather than the cheaper L2-retrain shortcut. The data-side fix path was independent of the control-loop fix and still had headroom remaining per `alignment_learnability.py`.
+
+### 2026-05-12 — Plan D (aic_act_v2 + 43-D state) shipped
+
+Pipeline executed end-to-end in a single overnight session:
+
+| Step | Result |
+|---|---|
+| Verify wrist_wrench is populated in collection | Mean fz 18.5 N, max 21 N, no NaN/zeros |
+| Generate dual-SFP-port trial config | 300 trials, 96 sfp_port_0 + 114 sfp_port_1 + 90 SC |
+| Smoke 20-ep collection | 20/20 saved, schema 43-D verified, all audit gates pass |
+| Full 300-ep aic_act_v2 collection | 300/300 saved, 0 dropped, ~6.7 h wall |
+| Audit | Episode 190 has 17 outlier frames (pose-delta glitch); excluded |
+| Train Plan D (40k steps, batch 8, 299 ep) | 1 h 48 m on local GPU |
+| Compose eval (3 runs) | **123.065 / 123.379 / 123.581** — min 123.06, var 0.5 |
+
+| Trial | Plan B v3 (May-5, shipping) | Plan B v3 image today | Plan D v1 (today) | Δ vs Plan B v3 image |
+|---|---|---|---|---|
+| 1 | 33.67 | 34.48 | **43.0** | +8.5 |
+| 2 | 43.54 | 43.22 | **42.6** | -0.6 |
+| 3 | 35.69 | ~35 | **37.6** | +2.6 |
+| **Total** | **112.90** | **112.83** | **123.34 (avg over 3 runs)** | **+10.5** |
+
+The win is almost entirely on T1: the augmented state seems to give the model enough signal to avoid the gripper-board contact that Plan B kept getting unlucky on. T2 stays at tier_2 ceiling, T3 stays clean. No insertion bonus in any trial (final distance 0.05–0.09 m on T1/T2, 0.07 m on T3) — the last-cm alignment problem is still there. Plan D wins on robustness, not capability.
+
+**Ship decision:** Plan D image tagged `plan-d-v1` and pushed to ECR. Gate: `min(3 runs)=123.06 > 115` (Plan B v3 + 9-pt rebuild-variance buffer). Win is +10 over the shipped baseline.
 
 
 

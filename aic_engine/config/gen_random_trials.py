@@ -171,6 +171,11 @@ def build_trial_sfp(rng: random.Random) -> dict:
         "cables": cable,
     }
 
+    # Each NIC card exposes TWO SFP ports (sfp_port_0 and sfp_port_1). Pre-Plan-D
+    # data collection only ever targeted sfp_port_0, which is one of the OOD holes
+    # that hurts compose trial 1 today. Coin-flip between them so the model sees
+    # both. The port pose is identical scene-side; only the task target changes.
+    target_port = rng.choice(("sfp_port_0", "sfp_port_1"))
     tasks = {
         "task_1": {
             "cable_type": "sfp_sc",
@@ -178,7 +183,7 @@ def build_trial_sfp(rng: random.Random) -> dict:
             "plug_type": "sfp",
             "plug_name": "sfp_tip",
             "port_type": "sfp",
-            "port_name": "sfp_port_0",
+            "port_name": target_port,
             "target_module_name": f"nic_card_mount_{target_rail}",
             "time_limit": 180,
         }

@@ -1,5 +1,13 @@
 # CheatCode Hackathon Success Plan
 
+> **Status (2026-05-12):** Plan D shipped to ECR; min compose 123.06. See
+> [`status.md`](status.md) for the project tracker and
+> [`phase_cdef_replan.md`](phase_cdef_replan.md) for the updated Phase C–F plan
+> that actually executed. This doc is kept for historical context but is no
+> longer the operative plan for Phases C–F. Operational recipes still useful
+> here: dataset collection ([`cheatcode_dataset_collection.md`](cheatcode_dataset_collection.md)) and
+> training notes ([`cheatcode_training_notes.md`](cheatcode_training_notes.md)).
+
 This document is the recommended one-week execution plan for maximizing score
 with the CheatCode-based imitation-learning pipeline.
 

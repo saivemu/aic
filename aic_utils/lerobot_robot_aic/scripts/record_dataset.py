@@ -28,6 +28,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import rclpy
+import yaml
 from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
 from aic_model_interfaces.msg import Observation
 from rclpy.node import Node
@@ -35,14 +36,20 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_robot_aic.recording_utils import pose_targets_to_action, stamp_to_nanoseconds
+from lerobot_robot_aic.task_encoding import TASK_DIM, encode_task
 
 
-# Match the published grkw/aic_act_policy / RunACT.prepare_observations exactly so
-# the trained model is drop-in compatible with the existing inference pipeline.
-IMAGE_SCALE = 0.25       # 1152x1024 -> 288x256
-IMAGE_HEIGHT = 256
-IMAGE_WIDTH = 288
-STATE_DIM = 26           # TCP pose 7 + lin vel 3 + ang vel 3 + tcp_error 6 + joints 7
+# Plan D schema (aic_act_v2). Differs from v1 in three ways:
+# 1. State adds wrist_wrench (6-D) and task one-hot (11-D) — see task_encoding.py.
+# 2. Images record at 0.5x scale (576x512) instead of 0.25x (288x256).
+# 3. Both SFP ports are exercised (gen_random_trials.py patch).
+# RunACT.py must mirror this schema at inference (state ordering + image scale).
+IMAGE_SCALE = 0.5        # 1152x1024 -> 576x512
+IMAGE_HEIGHT = 512
+IMAGE_WIDTH = 576
+STATE_BASE_DIM = 26      # TCP pose 7 + lin vel 3 + ang vel 3 + tcp_error 6 + joints 7
+WRENCH_DIM = 6           # force xyz + torque xyz
+STATE_DIM = STATE_BASE_DIM + WRENCH_DIM + TASK_DIM  # 26 + 6 + 11 = 43
 ACTION_DIM = 7           # linear xyz + angular xyz + 1 unused (gripper, kept 0)
 DEFAULT_TASK_DESCRIPTION = "Insert cable plug into target port"
 DEFAULT_MIN_EPISODE_FRAMES = 30  # discard sub-1.5s episodes (likely scene-reset glitches)
@@ -78,6 +85,33 @@ def features_spec() -> dict:
     }
 
 
+def _load_trial_task_list(trials_config_path: Path) -> list[tuple[str, str, str]]:
+    """Read a random_trials.yaml and extract per-trial (target_module, port, plug)
+    in the same iteration order the aic_engine uses. The engine iterates the
+    ``trials:`` dict insertion-order, so this needs to be a Python 3.7+ dict —
+    PyYAML safe_load preserves insertion order from the YAML source."""
+    with trials_config_path.open() as f:
+        cfg = yaml.safe_load(f)
+    trials = cfg.get("trials", {})
+    if not trials:
+        raise ValueError(f"No trials in {trials_config_path}")
+    out: list[tuple[str, str, str]] = []
+    for trial_name, trial in trials.items():
+        tasks = trial.get("tasks", {})
+        if not tasks:
+            raise ValueError(f"{trial_name} has no tasks")
+        # We assume one task per trial (true for all sample/random configs).
+        task = next(iter(tasks.values()))
+        out.append(
+            (
+                task["target_module_name"],
+                task["port_name"],
+                task["plug_type"],
+            )
+        )
+    return out
+
+
 class DatasetRecorder(Node):
     def __init__(
         self,
@@ -88,6 +122,7 @@ class DatasetRecorder(Node):
         max_action_age: float,
         min_episode_frames: int,
         task_description: str,
+        trial_task_list: list[tuple[str, str, str]],
         resume: bool = False,
     ):
         super().__init__("dataset_recorder")
@@ -108,6 +143,16 @@ class DatasetRecorder(Node):
         self.episodes_dropped = 0
         self._consecutive_save_failures = 0
         self._max_consecutive_save_failures = 2  # exit & finalize after N in a row
+
+        # Trial-task indexing. The recorder snoops topics, not the action goal,
+        # so we sync the task identity off the trial config + an attempt counter.
+        # Each call to _start_episode advances the index by one. This is robust to
+        # dropped episodes (drop still bumps the attempt index) but NOT robust to
+        # engine-side trial skips (rare; engine always runs every trial in order).
+        self.trial_task_list = trial_task_list
+        self.episode_attempt_idx = 0  # 0-based; next attempt gets this index
+        # Pre-built task vector for the currently-running episode.
+        self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
 
         # Pose-delta state: when MotionUpdate is in MODE_POSITION (CheatCode does
         # this), msg.velocity is zero. We synthesize the action by differencing
@@ -235,9 +280,26 @@ class DatasetRecorder(Node):
     def _start_episode(self) -> None:
         self.episode_in_progress = True
         self.frames_in_episode = 0
+        # Pull the next trial's task identity. If --resume bumped episodes_saved,
+        # we still want to align to (saved+dropped) attempts; for a fresh run
+        # that's just the running attempt counter.
+        idx = self.episode_attempt_idx
+        if idx < len(self.trial_task_list):
+            target_module, port_name, plug_type = self.trial_task_list[idx]
+            self.current_task_vec = encode_task(target_module, port_name, plug_type)
+            task_label = f"{target_module}/{port_name}/{plug_type}"
+        else:
+            self.get_logger().warn(
+                f"Episode attempt {idx} exceeds trial list of {len(self.trial_task_list)}; "
+                "task vector will be all zeros."
+            )
+            self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
+            task_label = "UNKNOWN"
+        self.episode_attempt_idx += 1
         self.get_logger().info(
             f"Episode {self.episodes_saved + 1} starting "
-            f"(saved={self.episodes_saved}, dropped={self.episodes_dropped})"
+            f"(saved={self.episodes_saved}, dropped={self.episodes_dropped}, "
+            f"attempt_idx={idx}, task={task_label})"
         )
 
     def _end_episode(self) -> None:
@@ -316,8 +378,10 @@ class DatasetRecorder(Node):
         try:
             tcp = obs.controller_state.tcp_pose
             tcp_vel = obs.controller_state.tcp_velocity
+            wrench = obs.wrist_wrench.wrench
             state = np.array(
                 [
+                    # Base 26-D (Plan A/B/C compatible) ------------------------
                     tcp.position.x,
                     tcp.position.y,
                     tcp.position.z,
@@ -333,6 +397,15 @@ class DatasetRecorder(Node):
                     tcp_vel.angular.z,
                     *list(obs.controller_state.tcp_error),
                     *list(obs.joint_states.position[:7]),
+                    # Wrist wrench 6-D — contact-stage discriminator ----------
+                    wrench.force.x,
+                    wrench.force.y,
+                    wrench.force.z,
+                    wrench.torque.x,
+                    wrench.torque.y,
+                    wrench.torque.z,
+                    # Task identity 11-D — see task_encoding.py ---------------
+                    *list(self.current_task_vec),
                 ],
                 dtype=np.float32,
             )
@@ -402,11 +475,26 @@ def main() -> None:
         help="Append to an existing dataset at --root. Required when adding episodes to a dataset "
         "produced by an earlier run.",
     )
+    parser.add_argument(
+        "--trials-config",
+        type=Path,
+        required=True,
+        help="Path to the random_trials.yaml the aic_engine is running. Used to map "
+        "attempt-index -> task identity (target_module / port_name / plug_type) so the "
+        "state vector carries a Plan-D one-hot task encoding. MUST be the same file the "
+        "engine is loading.",
+    )
     args = parser.parse_args()
 
     if args.root is None:
         args.root = str(Path.home() / ".cache" / "huggingface" / "lerobot" / args.repo_id)
     Path(args.root).parent.mkdir(parents=True, exist_ok=True)
+
+    trial_task_list = _load_trial_task_list(args.trials_config)
+    print(
+        f"Loaded {len(trial_task_list)} trial task identities from "
+        f"{args.trials_config}. First 3: {trial_task_list[:3]}"
+    )
 
     rclpy.init()
     recorder = DatasetRecorder(
@@ -417,8 +505,14 @@ def main() -> None:
         max_action_age=args.max_action_age,
         min_episode_frames=args.min_episode_frames,
         task_description=args.task_description,
+        trial_task_list=trial_task_list,
         resume=args.resume,
     )
+    # On --resume, restart the attempt counter at the saved-episodes mark.
+    # This assumes the user is resuming from where collection died and the
+    # engine is going to play the next trial from the YAML in order.
+    if args.resume:
+        recorder.episode_attempt_idx = recorder.episodes_saved
     target_total = (recorder.episodes_saved + args.num_episodes) if args.resume else args.num_episodes
     try:
         while rclpy.ok() and recorder.episodes_saved < target_total:

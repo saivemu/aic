@@ -44,6 +44,8 @@ from aic_control_interfaces.msg import (
     MotionUpdate,
     TrajectoryGenerationMode,
 )
+# Shared encoding so training-time recorder and inference-time RunACT agree.
+from lerobot_robot_aic.task_encoding import TASK_DIM, encode_task
 
 # Heavy imports (torch, numpy, cv2, draccus, lerobot, safetensors) are deferred
 # into RunACT.__init__ to keep top-level module import under the 30-second
@@ -144,6 +146,28 @@ class RunACT(Policy):
         self._action_norm_mode = norm_map.get("ACTION", "MEAN_STD")
         self._state_norm_mode = norm_map.get("STATE", "MEAN_STD")
 
+        # Read expected input shapes from the model's own config and adapt
+        # the observation packer to them. This lets RunACT serve both:
+        # - Plan B (state=[26], images=[3, 256, 288]) and
+        # - Plan D (state=[43], images=[3, 512, 576])
+        # from the same source without a code change per model.
+        input_features = config_dict.get("input_features", {})
+        state_shape = input_features.get("observation.state", {}).get("shape", [26])
+        self._expected_state_dim = int(state_shape[0])
+        # Plan D's extra dims are wrench (6) + task one-hot (TASK_DIM=11) =
+        # 26 + 17 = 43. If a future schema adds more, document here.
+        self._state_includes_wrench_and_task = self._expected_state_dim >= 26 + 6 + TASK_DIM
+
+        img_shape = (
+            input_features.get("observation.images.center_camera", {}).get("shape", [3, 256, 288])
+        )
+        # Source camera resolution (Basler) is 1152 wide x 1024 tall. Derive the
+        # scale from the model's declared image width; this keeps inference-side
+        # image preprocessing aligned with how training data was recorded.
+        BASLER_SRC_W = 1152
+        target_img_w = int(img_shape[2])
+        self.image_scaling = target_img_w / BASLER_SRC_W
+
         if policy_type == "act":
             config = draccus.decode(ACTConfig, config_dict)
             self.policy = ACTPolicy(config)
@@ -215,10 +239,15 @@ class RunACT(Policy):
         else:
             raise ValueError(f"Unsupported action norm mode: {self._action_norm_mode!r}")
 
-        # Config
-        self.image_scaling = 0.25  # Must match AICRobotAICControllerConfig
+        self.get_logger().info(
+            f"Normalization statistics loaded. expected_state_dim={self._expected_state_dim} "
+            f"(includes_wrench_and_task={self._state_includes_wrench_and_task}) "
+            f"image_scaling={self.image_scaling:.3f}"
+        )
 
-        self.get_logger().info("Normalization statistics loaded successfully.")
+        # Per-trial task one-hot — populated in insert_cable() from the Task struct.
+        # Stays zero for legacy (Plan B) checkpoints whose state vector is only 26-D.
+        self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
 
     @staticmethod
     def _img_to_tensor(
@@ -283,36 +312,49 @@ class RunACT(Policy):
         }
 
         # --- Process Robot State ---
-        # Construct flat state vector (26 dims) matching training order
+        # Order MUST match record_dataset.py exactly. The base 26 dims are shared
+        # across Plan A/B/C/D; Plan D appends wrench (6) and task one-hot (TASK_DIM).
         tcp_pose = obs_msg.controller_state.tcp_pose
         tcp_vel = obs_msg.controller_state.tcp_velocity
-
-        state_np = np.array(
-            [
-                # TCP Position (3)
-                tcp_pose.position.x,
-                tcp_pose.position.y,
-                tcp_pose.position.z,
-                # TCP Orientation (4)
-                tcp_pose.orientation.x,
-                tcp_pose.orientation.y,
-                tcp_pose.orientation.z,
-                tcp_pose.orientation.w,
-                # TCP Linear Vel (3)
-                tcp_vel.linear.x,
-                tcp_vel.linear.y,
-                tcp_vel.linear.z,
-                # TCP Angular Vel (3)
-                tcp_vel.angular.x,
-                tcp_vel.angular.y,
-                tcp_vel.angular.z,
-                # TCP Error (6)
-                *obs_msg.controller_state.tcp_error,
-                # Joint Positions (7)
-                *obs_msg.joint_states.position[:7],
-            ],
-            dtype=np.float32,
-        )
+        base = [
+            # TCP Position (3)
+            tcp_pose.position.x,
+            tcp_pose.position.y,
+            tcp_pose.position.z,
+            # TCP Orientation (4)
+            tcp_pose.orientation.x,
+            tcp_pose.orientation.y,
+            tcp_pose.orientation.z,
+            tcp_pose.orientation.w,
+            # TCP Linear Vel (3)
+            tcp_vel.linear.x,
+            tcp_vel.linear.y,
+            tcp_vel.linear.z,
+            # TCP Angular Vel (3)
+            tcp_vel.angular.x,
+            tcp_vel.angular.y,
+            tcp_vel.angular.z,
+            # TCP Error (6)
+            *obs_msg.controller_state.tcp_error,
+            # Joint Positions (7)
+            *obs_msg.joint_states.position[:7],
+        ]
+        if self._state_includes_wrench_and_task:
+            w = obs_msg.wrist_wrench.wrench
+            base.extend(
+                [
+                    w.force.x, w.force.y, w.force.z,
+                    w.torque.x, w.torque.y, w.torque.z,
+                ]
+            )
+            base.extend(self.current_task_vec.tolist())
+        state_np = np.array(base, dtype=np.float32)
+        if state_np.shape[0] != self._expected_state_dim:
+            raise RuntimeError(
+                f"prepare_observations built state of dim {state_np.shape[0]} "
+                f"but model expects {self._expected_state_dim}. Check schema parity "
+                f"between record_dataset.py and RunACT.py."
+            )
 
         # Normalize State per the configured mode.
         raw_state_tensor = (
@@ -352,6 +394,20 @@ class RunACT(Policy):
         """
         self.policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
+
+        # Build the task identity one-hot exactly as record_dataset.py does for
+        # training data. Stays at zeros for Plan B (state dim 26) checkpoints.
+        if self._state_includes_wrench_and_task:
+            self.current_task_vec = encode_task(
+                task.target_module_name, task.port_name, task.plug_type
+            )
+            self.get_logger().info(
+                f"Task encoding: {self.current_task_vec.tolist()} "
+                f"(target={task.target_module_name} port={task.port_name} plug={task.plug_type})"
+            )
+        else:
+            # Defensive reset in case a later checkpoint shrinks state again.
+            self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
 
         # Wait up to 5 sim-seconds for the first observation.
         start_t = self.time_now()

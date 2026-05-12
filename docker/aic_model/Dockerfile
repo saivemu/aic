@@ -25,12 +25,18 @@ RUN --mount=type=cache,target=/root/.cache/rattler/cache --mount=type=cache,targ
 RUN cp -r /ws_aic/src/aic/aic_example_policies/aic_example_policies/. \
        /ws_aic/src/aic/.pixi/envs/default/lib/python3.12/site-packages/aic_example_policies/
 
-# Bake ONLY Plan B for submission (Plan-B-only build). The full multi-plan
-# Dockerfile bakes both plans + uses AIC_POLICY_PLAN env to dispatch, but for
-# leaderboard submission we ship the smallest working image: Plan B alone.
+# Same overlay for lerobot_robot_aic so RunACT.py's `from lerobot_robot_aic.
+# task_encoding import ...` picks up the new module without a full pixi rebuild.
+RUN cp -r /ws_aic/src/aic/aic_utils/lerobot_robot_aic/lerobot_robot_aic/. \
+       /ws_aic/src/aic/.pixi/envs/default/lib/python3.12/site-packages/lerobot_robot_aic/
+
+# Bake Plan B AND Plan D so docker-compose can switch between them at runtime
+# via AIC_POLICY_PLAN={b,d}. Defaults to plan d. Plan B stays available as a
+# fallback / regression baseline.
 # The competition network has internal=true so HuggingFace is unreachable at
-# runtime; the model must already be on disk inside the container.
+# runtime; the models must already be on disk inside the container.
 COPY outputs/plan_b/pretrained_model /opt/policy_b
+COPY outputs/plan_d/pretrained_model /opt/policy_d
 
 # Sanity-check the policy module imports under cluster timing constraints. If
 # this RUN takes more than a few seconds, the model_discovery_timeout will

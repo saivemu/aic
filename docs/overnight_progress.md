@@ -127,5 +127,19 @@ The win is almost entirely on T1: the augmented state seems to give the model en
 
 **Ship decision:** Plan D image tagged `plan-d-v1` and pushed to ECR. Gate: `min(3 runs)=123.06 > 115` (Plan B v3 + 9-pt rebuild-variance buffer). Win is +10 over the shipped baseline.
 
+Submission URI: `973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/bot-squad-l2-learning-loop:plan-d-v1`
+Digest: `sha256:0be3ba70a5acea742f3660a8a9822fbcddba3d0bae1e09f6cb46ce21339c0e72`
+
+### Pixi-env quirks worth knowing about
+
+1. **torchcodec disabled.** The pixi env ships `ffmpeg 8.0.1` (libavutil.so.60) and `torchcodec 0.5` which requires ffmpeg 4–7 (libavutil.so.56–59). The two are incompatible. Worked around by renaming
+   - `.pixi/envs/default/lib/python3.12/site-packages/torchcodec` → `torchcodec.disabled`
+   - `.pixi/envs/default/lib/python3.12/site-packages/torchcodec-0.5.dist-info` → `*.disabled`
+   so `importlib.util.find_spec("torchcodec")` returns None and lerobot falls back to its native pyav backend. **A future `pixi reinstall` will undo this** — either redo the rename or fix the lockfile (pin ffmpeg ≤ 7 or upgrade torchcodec).
+
+2. **`lerobot_robot_aic.__init__.py` is lazy.** Eager `from .aic_robot_aic_controller import …` previously tripped a libtiff/libjpeg ABI clash when lerobot-train pre-loaded torchvision/transformers. Lazy `__getattr__` resolves to the submodule on first attribute access; runtime callers (recorder, RunACT) see no API change.
+
+3. **Recorder `--trials-config` is mandatory now.** It maps attempt-index → task identity. Pre-Plan-D collections worked without it because the state didn't include task one-hot.
+
 
 

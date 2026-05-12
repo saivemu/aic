@@ -2,6 +2,12 @@
 
 Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-12. If anything below disagrees with reality, fix this doc.
 
+**Companion docs you'll want open:**
+- [`cheatcode_hackathon_success_plan.md`](cheatcode_hackathon_success_plan.md) — original strategy doc (Phases A–F). Now superseded for C–F by `phase_cdef_replan.md`, but Phases A/B are still valid background.
+- [`cheatcode_dataset_collection.md`](cheatcode_dataset_collection.md) — the operational recipe for running the eval-stack + CheatCode + recorder pipeline. The how-to behind the dataset rows in the tracker below.
+- [`cheatcode_training_notes.md`](cheatcode_training_notes.md) — implementation details for the recorder + training side (recorder QoS, action synthesis, episode boundaries).
+- See the full doc map at the bottom.
+
 ## Tracker at a glance
 
 | Plan | Architecture | Dataset | State | Image | Compose total | Status |

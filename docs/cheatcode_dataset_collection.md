@@ -1,5 +1,12 @@
 # CheatCode LeRobot Dataset Collection
 
+> See [`status.md`](status.md) for the project tracker (which plan is currently
+> shipped, scores, and what's left). This page is just the recipe for the
+> collection step. The plan that drives it lives in
+> [`cheatcode_hackathon_success_plan.md`](cheatcode_hackathon_success_plan.md)
+> (original May-10 strategy) or
+> [`phase_cdef_replan.md`](phase_cdef_replan.md) (post-Plan-D replan).
+
 This workflow records imitation-learning data by running the provided
 `aic_example_policies.ros.CheatCode` policy with `ground_truth:=true` during
 training. Challenge rules allow ground-truth simulator state during training,

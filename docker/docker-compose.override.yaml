@@ -1,0 +1,5 @@
+name: aic
+services:
+  eval:
+    volumes:
+      - ${HOME}/aic_results:/root/aic_results

@@ -122,10 +122,12 @@ class RunACT(Policy):
         # docker-compose.yaml) selects one without a rebuild. Defaults to Plan B
         # since it scored 112.90 vs Plan C's 86.03 in compose eval.
         plan = os.environ.get("AIC_POLICY_PLAN", "b").lower()
-        if plan not in ("b", "c"):
+        if plan not in ("b", "c", "d"):
             raise ValueError(
-                f"AIC_POLICY_PLAN must be 'b' or 'c' (got {plan!r}). "
-                "b = Plan B (ACT 300 ep). c = Plan C (Diffusion 300 ep)."
+                f"AIC_POLICY_PLAN must be 'b', 'c', or 'd' (got {plan!r}). "
+                "b = Plan B (ACT 300 ep, 26-D state). "
+                "c = Plan C (Diffusion 300 ep). "
+                "d = Plan D (ACT 299 ep, 43-D state with wrench + task one-hot)."
             )
         policy_path = Path(f"/opt/policy_{plan}")
         if not policy_path.exists():

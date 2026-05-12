@@ -28,9 +28,9 @@ services:
       AIC_ROUTER_ADDR: eval:7447
       AIC_MODEL_PASSWD: CHANGE_IN_PROD
       # Switch policy at runtime without rebuilding:
-      #   default        ->  Plan B (ACT 300ep, compose 112.90)  [shipping]
-      #   AIC_POLICY_PLAN=c docker compose ... up  ->  Plan C (Diffusion 300ep, compose 86.03)
-      AIC_POLICY_PLAN: ${AIC_POLICY_PLAN:-b}
+      #   default                  -> Plan D (ACT 299ep, 43-D state, image_scale 0.5)
+      #   AIC_POLICY_PLAN=b ...up  -> Plan B (ACT 300ep, 26-D state, image_scale 0.25; compose 112.90)
+      AIC_POLICY_PLAN: ${AIC_POLICY_PLAN:-d}
       # AIC_ENABLE_ACL: true
 networks:
   default:

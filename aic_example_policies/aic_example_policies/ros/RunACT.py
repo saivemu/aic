@@ -194,7 +194,6 @@ class RunACT(Policy):
                 "std": get_stat("observation.images.right_camera.std", (1, 3, 1, 1)),
             },
         }
-        print(f"Image stats: {self.img_stats}")
 
         # Robot State Stats (1, 26) — load mean/std OR min/max depending on mode.
         if self._state_norm_mode == "MEAN_STD":

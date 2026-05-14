@@ -1,11 +1,12 @@
 # Project status — AIC cable insertion
 
-Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-12. If anything below disagrees with reality, fix this doc.
+Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-14. If anything below disagrees with reality, fix this doc.
 
 **Companion docs you'll want open:**
 - [`cheatcode_hackathon_success_plan.md`](cheatcode_hackathon_success_plan.md) — original strategy doc (Phases A–F). Now superseded for C–F by `phase_cdef_replan.md`, but Phases A/B are still valid background.
 - [`cheatcode_dataset_collection.md`](cheatcode_dataset_collection.md) — the operational recipe for running the eval-stack + CheatCode + recorder pipeline. The how-to behind the dataset rows in the tracker below.
 - [`cheatcode_training_notes.md`](cheatcode_training_notes.md) — implementation details for the recorder + training side (recorder QoS, action synthesis, episode boundaries).
+- [`visual_servo_experiment_log.md`](visual_servo_experiment_log.md) — May-14 final-alignment experiments, scores, dead ends, and next steps.
 - See the full doc map at the bottom.
 
 ## Tracker at a glance
@@ -16,9 +17,11 @@ Single source of truth for what's been done, what's shipped, and what's still op
 | **B** | ACT, 40k steps (val-split) | `aic_act_v1` (300 ep) | 26-D | 288×256 | **112.90** ¹ | superseded by D |
 | **C** | Diffusion, 40k steps | `aic_act_v1` (300 ep, same as B) | 26-D | 288×256 | **86.03** | preserved, not deployed |
 | **D** | ACT, 40k steps | `aic_act_v2` (299 ep, ep 190 excluded) | 43-D | 576×512 | **123.06 / 123.38 / 123.58** ² | **shipped to ECR 2026-05-12** |
+| **E** | Plan D + optional final visual servo/search/insertion handoff | local TF-labeled visual-servo data | 43-D | 576×512 | **124.85 best local** ³ | experimental, not shipped |
 
 ¹ Plan B as recorded May-5 from image `aic-runact:plan-b-v3`. Rebuilding the same source today gets 103.6 due to a cuDNN kernel-selection drift; this is the rebuild-variance floor we used to set Plan D's 115 ship gate.
 ² Plan D: min over 3 back-to-back compose runs is 123.06; variance 0.5 pts.
+³ Plan E best is the xy-direction visual-servo branch. It improved local proximity score slightly but did not create contact or insertion, so it is not yet a >150 path.
 
 ## What's currently shipped
 
@@ -27,6 +30,21 @@ Single source of truth for what's been done, what's shipped, and what's still op
 - **Manual step pending (you):** paste that URI into the AIC submission portal.
 
 The image also bakes Plan B at `/opt/policy_b` as a fallback; flip with `AIC_POLICY_PLAN=b` in `docker/docker-compose.yaml`.
+
+## May-14 final-alignment experiments
+
+The branch now has optional scaffolding for three final-stage ideas: a guarded
+search, an insertion-only policy handoff, and a learned visual servo. The default
+runtime remains Plan D unless the new environment variables are set.
+
+Best result from this round is **124.85** with a discrete `xy_direction` visual
+servo model starting late and keeping Plan D's z behavior. It did **not** get
+contact or insertion. A 45 s trial cap dropped score to **112.56**, so the
+speed lesson is explicit: do not spend extra time unless the final controller
+reliably converts into contact/insertion.
+
+Full details, artifact paths, commands, and the recommended next order are in
+[`visual_servo_experiment_log.md`](visual_servo_experiment_log.md).
 
 ## Datasets on disk / Hub
 
@@ -94,3 +112,4 @@ These will bite if anyone rebuilds the environment from scratch:
 | [`phase_cdef_replan.md`](phase_cdef_replan.md) | Updated Phase C–F plan (May 11) after the regression investigation; what Plan D actually did. |
 | [`cheatcode_dataset_collection.md`](cheatcode_dataset_collection.md) | How to drive the eval-stack + CheatCode + recorder pipeline. |
 | [`cheatcode_training_notes.md`](cheatcode_training_notes.md) | Implementation notes for the recorder/training side. |
+| [`visual_servo_experiment_log.md`](visual_servo_experiment_log.md) | May-14 visual-servo/final-alignment experiment log and next-step order. |

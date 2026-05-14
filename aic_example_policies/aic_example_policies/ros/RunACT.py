@@ -187,6 +187,18 @@ class RunACT(Policy):
         self.policy.load_state_dict(load_file(model_weights_path))
         self.policy.eval()
         self.policy.to(self.device)
+        self.insert_policy = None
+        self._insert_state_norm_mode = None
+        self._insert_action_norm_mode = None
+        self.insert_img_stats = None
+        self.insert_state_mean = None
+        self.insert_state_std = None
+        self.insert_state_min = None
+        self.insert_state_max = None
+        self.insert_action_mean = None
+        self.insert_action_std = None
+        self.insert_action_min = None
+        self.insert_action_max = None
 
         self.get_logger().info(
             f"{policy_type.upper()} Policy loaded on {self.device} from {policy_path} "
@@ -209,22 +221,28 @@ class RunACT(Policy):
         self.img_stats = {
             "left": {
                 "mean": get_stat("observation.images.left_camera.mean", (1, 3, 1, 1)),
-                "std": get_stat("observation.images.left_camera.std", (1, 3, 1, 1)),
+                "std": self._safe_denominator(
+                    get_stat("observation.images.left_camera.std", (1, 3, 1, 1))
+                ),
             },
             "center": {
                 "mean": get_stat("observation.images.center_camera.mean", (1, 3, 1, 1)),
-                "std": get_stat("observation.images.center_camera.std", (1, 3, 1, 1)),
+                "std": self._safe_denominator(
+                    get_stat("observation.images.center_camera.std", (1, 3, 1, 1))
+                ),
             },
             "right": {
                 "mean": get_stat("observation.images.right_camera.mean", (1, 3, 1, 1)),
-                "std": get_stat("observation.images.right_camera.std", (1, 3, 1, 1)),
+                "std": self._safe_denominator(
+                    get_stat("observation.images.right_camera.std", (1, 3, 1, 1))
+                ),
             },
         }
 
         # Robot State Stats (1, 26) — load mean/std OR min/max depending on mode.
         if self._state_norm_mode == "MEAN_STD":
             self.state_mean = get_stat("observation.state.mean", (1, -1))
-            self.state_std = get_stat("observation.state.std", (1, -1))
+            self.state_std = self._safe_denominator(get_stat("observation.state.std", (1, -1)))
         elif self._state_norm_mode == "MIN_MAX":
             self.state_min = get_stat("observation.state.min", (1, -1))
             self.state_max = get_stat("observation.state.max", (1, -1))
@@ -247,9 +265,292 @@ class RunACT(Policy):
             f"image_scaling={self.image_scaling:.3f}"
         )
 
+        insert_policy_raw = os.environ.get("AIC_INSERT_POLICY_PATH", "").strip()
+        self.insert_policy_start_s = float(os.environ.get("AIC_INSERT_POLICY_START_S", "8.0"))
+        self.insert_policy_max_lin_speed_mps = float(
+            os.environ.get("AIC_INSERT_POLICY_MAX_LIN_SPEED_MPS", "0.020")
+        )
+        self.insert_policy_mode = os.environ.get("AIC_INSERT_POLICY_MODE", "full").lower()
+        if self.insert_policy_mode not in {"full", "xy_down"}:
+            raise ValueError(
+                "AIC_INSERT_POLICY_MODE must be 'full' or 'xy_down' "
+                f"(got {self.insert_policy_mode!r})"
+            )
+        self.insert_policy_xy_gain = float(os.environ.get("AIC_INSERT_POLICY_XY_GAIN", "1.0"))
+        self.insert_policy_max_xy_speed_mps = float(
+            os.environ.get(
+                "AIC_INSERT_POLICY_MAX_XY_SPEED_MPS",
+                str(self.insert_policy_max_lin_speed_mps),
+            )
+        )
+        self.insert_policy_down_vz_mps = float(
+            os.environ.get("AIC_INSERT_POLICY_DOWN_VZ_MPS", "-0.006")
+        )
+        if insert_policy_raw:
+            insert_policy_path = Path(insert_policy_raw)
+            if not insert_policy_path.exists():
+                raise FileNotFoundError(f"AIC_INSERT_POLICY_PATH does not exist: {insert_policy_path}")
+            with open(insert_policy_path / "config.json", "r") as f:
+                insert_config_dict = json.load(f)
+            insert_policy_type = insert_config_dict.pop("type", "act")
+            insert_norm_map = insert_config_dict.get("normalization_mapping", {})
+            self._insert_state_norm_mode = insert_norm_map.get("STATE", "MEAN_STD")
+            self._insert_action_norm_mode = insert_norm_map.get("ACTION", "MEAN_STD")
+            if insert_policy_type != "act":
+                raise ValueError(
+                    f"AIC_INSERT_POLICY_PATH must point to an ACT checkpoint, got {insert_policy_type!r}"
+                )
+            insert_input_features = insert_config_dict.get("input_features", {})
+            insert_state_shape = insert_input_features.get("observation.state", {}).get("shape", [])
+            if int(insert_state_shape[0]) != self._expected_state_dim:
+                raise ValueError(
+                    f"Insertion policy state dim {insert_state_shape} does not match "
+                    f"base policy state dim {self._expected_state_dim}"
+                )
+            insert_config = draccus.decode(ACTConfig, insert_config_dict)
+            self.insert_policy = ACTPolicy(insert_config)
+            self.insert_policy.load_state_dict(load_file(insert_policy_path / "model.safetensors"))
+            self.insert_policy.eval()
+            self.insert_policy.to(self.device)
+
+            insert_stats = load_file(
+                insert_policy_path / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+            )
+
+            def get_insert_stat(key, shape):
+                return insert_stats[key].to(self.device).view(*shape)
+
+            self.insert_img_stats = {
+                "left": {
+                    "mean": get_insert_stat("observation.images.left_camera.mean", (1, 3, 1, 1)),
+                    "std": self._safe_denominator(
+                        get_insert_stat("observation.images.left_camera.std", (1, 3, 1, 1))
+                    ),
+                },
+                "center": {
+                    "mean": get_insert_stat("observation.images.center_camera.mean", (1, 3, 1, 1)),
+                    "std": self._safe_denominator(
+                        get_insert_stat("observation.images.center_camera.std", (1, 3, 1, 1))
+                    ),
+                },
+                "right": {
+                    "mean": get_insert_stat("observation.images.right_camera.mean", (1, 3, 1, 1)),
+                    "std": self._safe_denominator(
+                        get_insert_stat("observation.images.right_camera.std", (1, 3, 1, 1))
+                    ),
+                },
+            }
+            if self._insert_state_norm_mode == "MEAN_STD":
+                self.insert_state_mean = get_insert_stat("observation.state.mean", (1, -1))
+                self.insert_state_std = self._safe_denominator(
+                    get_insert_stat("observation.state.std", (1, -1))
+                )
+            elif self._insert_state_norm_mode == "MIN_MAX":
+                self.insert_state_min = get_insert_stat("observation.state.min", (1, -1))
+                self.insert_state_max = get_insert_stat("observation.state.max", (1, -1))
+            else:
+                raise ValueError(
+                    f"Unsupported insertion state norm mode: {self._insert_state_norm_mode!r}"
+                )
+            if self._insert_action_norm_mode == "MEAN_STD":
+                self.insert_action_mean = get_insert_stat("action.mean", (1, -1))
+                self.insert_action_std = get_insert_stat("action.std", (1, -1))
+            elif self._insert_action_norm_mode == "MIN_MAX":
+                self.insert_action_min = get_insert_stat("action.min", (1, -1))
+                self.insert_action_max = get_insert_stat("action.max", (1, -1))
+            else:
+                raise ValueError(
+                    f"Unsupported insertion action norm mode: {self._insert_action_norm_mode!r}"
+                )
+            self.get_logger().warn(
+                f"Experimental insertion ACT loaded from {insert_policy_path}; "
+                f"start={self.insert_policy_start_s:.1f}s "
+                f"mode={self.insert_policy_mode} "
+                f"max_lin_speed={self.insert_policy_max_lin_speed_mps * 1000:.1f}mm/s "
+                f"max_xy_speed={self.insert_policy_max_xy_speed_mps * 1000:.1f}mm/s "
+                f"xy_gain={self.insert_policy_xy_gain:.2f} "
+                f"down_vz={self.insert_policy_down_vz_mps * 1000:.1f}mm/s "
+                f"(state_norm={self._insert_state_norm_mode}, "
+                f"action_norm={self._insert_action_norm_mode})"
+            )
+
         # Per-trial task one-hot — populated in insert_cable() from the Task struct.
         # Stays zero for legacy (Plan B) checkpoints whose state vector is only 26-D.
         self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
+
+        # Optional learned final-stage visual servo. The model is trained from
+        # TF-labeled images but at runtime consumes only Observation fields.
+        self.visual_servo_model = None
+        self.visual_servo_start_s = float(os.environ.get("AIC_VISUAL_SERVO_START_S", "8.0"))
+        self.visual_servo_gain = float(os.environ.get("AIC_VISUAL_SERVO_GAIN", "0.75"))
+        self.visual_servo_max_xy_speed_mps = float(
+            os.environ.get("AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS", "0.010")
+        )
+        self.visual_servo_max_z_speed_mps = float(
+            os.environ.get("AIC_VISUAL_SERVO_MAX_Z_SPEED_MPS", "0.020")
+        )
+        self.visual_servo_down_vz_mps = float(
+            os.environ.get("AIC_VISUAL_SERVO_DOWN_VZ_MPS", "-0.006")
+        )
+        self.visual_servo_z_mode = os.environ.get("AIC_VISUAL_SERVO_Z_MODE", "act").strip().lower()
+        self.max_trial_s = float(os.environ.get("AIC_MAX_TRIAL_S", "30.0"))
+        valid_visual_servo_z_modes = {
+            "act",
+            "hold",
+            "down",
+            "gate_down",
+            "gate_act_down",
+            "pred",
+            "gate_pred",
+        }
+        if self.visual_servo_z_mode not in valid_visual_servo_z_modes:
+            self.get_logger().warn(
+                f"Unsupported AIC_VISUAL_SERVO_Z_MODE={self.visual_servo_z_mode!r}; using 'act'."
+            )
+            self.visual_servo_z_mode = "act"
+        self.visual_servo_descend_xy_gate_m = float(
+            os.environ.get("AIC_VISUAL_SERVO_DESCEND_XY_GATE_M", "0.010")
+        )
+        self.visual_servo_max_abs_err_m = float(
+            os.environ.get("AIC_VISUAL_SERVO_MAX_ABS_ERR_M", "0.050")
+        )
+        self.visual_servo_xy_sign = np.array(
+            [
+                float(os.environ.get("AIC_VISUAL_SERVO_X_SIGN", "1.0")),
+                float(os.environ.get("AIC_VISUAL_SERVO_Y_SIGN", "1.0")),
+            ],
+            dtype=np.float64,
+        )
+        self.visual_servo_direction_speed_mps = float(
+            os.environ.get("AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS", "0.006")
+        )
+        self._last_visual_servo_direction_classes = None
+        self._last_visual_servo_direction_probs = None
+        self._last_visual_servo_pixel_delta_px = None
+        self.visual_servo_pixel_to_base_xy = None
+        visual_servo_raw = os.environ.get("AIC_VISUAL_SERVO_MODEL_PATH", "").strip()
+        if visual_servo_raw:
+            visual_servo_path = Path(visual_servo_raw)
+            if not visual_servo_path.exists():
+                raise FileNotFoundError(
+                    f"AIC_VISUAL_SERVO_MODEL_PATH does not exist: {visual_servo_path}"
+                )
+            checkpoint = torch.load(visual_servo_path, map_location=self.device)
+            visual_cfg = checkpoint.get("config", {})
+            visual_target = str(visual_cfg.get("target", "base.delta_port_minus_plug_m"))
+            self.visual_servo_target_mode = str(
+                visual_cfg.get(
+                    "target_mode",
+                    "action_linear" if visual_target == "action.linear_xyz_mps" else "delta",
+                )
+            )
+            if self.visual_servo_target_mode not in {
+                "delta",
+                "action_linear",
+                "xy_direction",
+                "pixel_delta",
+            }:
+                raise ValueError(
+                    f"Unsupported visual-servo target mode: {self.visual_servo_target_mode!r}"
+                )
+            self.visual_servo_image_width = int(visual_cfg.get("image_width", 224))
+            self.visual_servo_image_height = int(visual_cfg.get("image_height", 224))
+            self.visual_servo_target_scale = float(visual_cfg.get("target_scale", 1000.0))
+            if "AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS" not in os.environ:
+                self.visual_servo_direction_speed_mps = float(
+                    visual_cfg.get(
+                        "direction_speed_mps",
+                        self.visual_servo_direction_speed_mps,
+                    )
+                )
+            pixel_to_base_xy = visual_cfg.get("pixel_to_base_xy")
+            if pixel_to_base_xy is not None:
+                self.visual_servo_pixel_to_base_xy = np.asarray(
+                    pixel_to_base_xy,
+                    dtype=np.float64,
+                )
+            image_mean = visual_cfg.get("image_mean", [0.485, 0.456, 0.406])
+            image_std = visual_cfg.get("image_std", [0.229, 0.224, 0.225])
+            self.visual_servo_img_mean = (
+                torch.tensor(image_mean, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+            )
+            self.visual_servo_img_std = self._safe_denominator(
+                torch.tensor(image_std, dtype=torch.float32, device=self.device).view(1, 3, 1, 1)
+            )
+            self.visual_servo_model = self._build_visual_servo_model(
+                state_dim=int(visual_cfg.get("state_dim", 43)),
+                output_dim=int(visual_cfg.get("output_dim", 3)),
+            )
+            self.visual_servo_model.load_state_dict(checkpoint["model_state_dict"])
+            self.visual_servo_model.eval()
+            self.visual_servo_model.to(self.device)
+            metrics = checkpoint.get("metrics", {})
+            self.get_logger().warn(
+                f"Experimental visual servo loaded from {visual_servo_path}; "
+                f"start={self.visual_servo_start_s:.1f}s "
+                f"target_mode={self.visual_servo_target_mode} "
+                f"gain={self.visual_servo_gain:.2f} "
+                f"max_xy_speed={self.visual_servo_max_xy_speed_mps * 1000:.1f}mm/s "
+                f"max_z_speed={self.visual_servo_max_z_speed_mps * 1000:.1f}mm/s "
+                f"down_vz={self.visual_servo_down_vz_mps * 1000:.1f}mm/s "
+                f"direction_speed={self.visual_servo_direction_speed_mps * 1000:.1f}mm/s "
+                f"z_mode={self.visual_servo_z_mode} "
+                f"descend_gate={self.visual_servo_descend_xy_gate_m * 1000:.1f}mm "
+                f"xy_sign={self.visual_servo_xy_sign.tolist()} "
+                f"val_xy_mae={metrics.get('mae_xy_norm_mm', float('nan')):.2f}mm"
+            )
+
+        # Experimental final-stage controller. Disabled by default so Plan D stays
+        # a clean fallback. When enabled, ACT still handles gross motion; after a
+        # fixed trial time, a bounded xy spiral with gentle downward push tries to
+        # convert near-port proximity into partial/full insertion.
+        self.final_search_enabled = os.environ.get("AIC_ENABLE_FINAL_SEARCH", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        self.final_search_start_s = float(os.environ.get("AIC_FINAL_SEARCH_START_S", "8.0"))
+        self.final_search_max_radius_m = float(os.environ.get("AIC_FINAL_SEARCH_RADIUS_M", "0.035"))
+        self.final_search_growth_mps = float(os.environ.get("AIC_FINAL_SEARCH_GROWTH_MPS", "0.0035"))
+        self.final_search_period_s = float(os.environ.get("AIC_FINAL_SEARCH_PERIOD_S", "4.0"))
+        self.final_search_max_xy_speed_mps = float(
+            os.environ.get("AIC_FINAL_SEARCH_MAX_XY_SPEED_MPS", "0.010")
+        )
+        self.final_search_down_vz_mps = float(os.environ.get("AIC_FINAL_SEARCH_DOWN_VZ_MPS", "-0.006"))
+        if self.final_search_enabled:
+            self.get_logger().warn(
+                "Experimental final search enabled: "
+                f"start={self.final_search_start_s:.1f}s "
+                f"radius={self.final_search_max_radius_m * 1000:.0f}mm "
+                f"xy_speed={self.final_search_max_xy_speed_mps * 1000:.1f}mm/s "
+                f"vz={self.final_search_down_vz_mps * 1000:.1f}mm/s"
+            )
+
+        # Training-only DAgger collection mode. When enabled under
+        # ground_truth:=true, Plan D runs the approach so the robot reaches the
+        # same near-port states seen at evaluation time, then CheatCode finishes
+        # the alignment/insertion and supplies the final-stage labels recorded by
+        # record_dataset.py. This must remain disabled for scoring/submission.
+        self.dagger_cheatcode_handoff_enabled = os.environ.get(
+            "AIC_DAGGER_CHEATCODE_HANDOFF", ""
+        ).lower() in {"1", "true", "yes"}
+        self.dagger_cheatcode_handoff_s = float(
+            os.environ.get("AIC_DAGGER_CHEATCODE_HANDOFF_S", "10.0")
+        )
+        if self.dagger_cheatcode_handoff_enabled:
+            self.get_logger().warn(
+                "Training-only DAgger CheatCode handoff enabled: "
+                f"handoff={self.dagger_cheatcode_handoff_s:.1f}s. "
+                "Use only with ground_truth:=true data collection."
+            )
+
+    @staticmethod
+    def _safe_denominator(tensor: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        return torch.where(
+            tensor.abs() < eps,
+            torch.full_like(tensor, eps),
+            tensor,
+        )
 
     @staticmethod
     def _img_to_tensor(
@@ -285,8 +586,202 @@ class RunACT(Policy):
         # Formula: (x - mean) / std
         return (tensor - mean) / std
 
-    def prepare_observations(self, obs_msg: Observation) -> Dict[str, torch.Tensor]:
+    def _build_visual_servo_model(self, state_dim: int, output_dim: int) -> torch.nn.Module:
+        """Architecture mirror for train_visual_servo.py."""
+        nn = torch.nn
+
+        class VisualServoNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.image_encoder = nn.Sequential(
+                    nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
+                    nn.BatchNorm2d(16),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                    nn.BatchNorm2d(32),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(inplace=True),
+                    nn.AdaptiveAvgPool2d((1, 1)),
+                    nn.Flatten(),
+                )
+                self.state_encoder = nn.Sequential(
+                    nn.Linear(state_dim, 128),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(128, 64),
+                    nn.ReLU(inplace=True),
+                )
+                self.head = nn.Sequential(
+                    nn.Linear(128 + 64, 128),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(128, 64),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(64, output_dim),
+                )
+
+            def forward(self, image: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+                image_features = self.image_encoder(image)
+                state_features = self.state_encoder(state)
+                return self.head(torch.cat([image_features, state_features], dim=1))
+
+        return VisualServoNet()
+
+    def _raw_plan_d_state(self, obs_msg: Observation) -> np.ndarray:
+        """Build the raw 43-D state used by the visual-servo regressor."""
+        tcp_pose = obs_msg.controller_state.tcp_pose
+        tcp_vel = obs_msg.controller_state.tcp_velocity
+        wrench = obs_msg.wrist_wrench.wrench
+        return np.array(
+            [
+                tcp_pose.position.x,
+                tcp_pose.position.y,
+                tcp_pose.position.z,
+                tcp_pose.orientation.x,
+                tcp_pose.orientation.y,
+                tcp_pose.orientation.z,
+                tcp_pose.orientation.w,
+                tcp_vel.linear.x,
+                tcp_vel.linear.y,
+                tcp_vel.linear.z,
+                tcp_vel.angular.x,
+                tcp_vel.angular.y,
+                tcp_vel.angular.z,
+                *obs_msg.controller_state.tcp_error,
+                *obs_msg.joint_states.position[:7],
+                wrench.force.x,
+                wrench.force.y,
+                wrench.force.z,
+                wrench.torque.x,
+                wrench.torque.y,
+                wrench.torque.z,
+                *self.current_task_vec,
+            ],
+            dtype=np.float32,
+        )
+
+    def _predict_visual_servo_output_si(self, obs_msg: Observation) -> np.ndarray | None:
+        """Predict visual-servo output in SI units.
+
+        ``delta`` checkpoints output base-frame port-minus-plug xyz in meters.
+        ``action_linear`` checkpoints output linear xyz velocity in m/s.
+        ``xy_direction`` checkpoints output x/y sign classes that are converted
+        into a fixed small linear velocity in m/s.
+        ``pixel_delta`` checkpoints output center-image port-minus-plug pixel
+        offset, which is converted to base-frame xy by a training-time
+        calibration matrix.
+        """
+        if self.visual_servo_model is None:
+            return None
+        img_np = np.frombuffer(obs_msg.center_image.data, dtype=np.uint8).reshape(
+            obs_msg.center_image.height,
+            obs_msg.center_image.width,
+            3,
+        )
+        img_np = cv2.resize(
+            img_np,
+            (self.visual_servo_image_width, self.visual_servo_image_height),
+            interpolation=cv2.INTER_AREA,
+        )
+        image_tensor = (
+            torch.from_numpy(np.ascontiguousarray(img_np))
+            .permute(2, 0, 1)
+            .float()
+            .div(255.0)
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        image_tensor = (
+            image_tensor - self.visual_servo_img_mean
+        ) / self.visual_servo_img_std
+
+        state_np = self._raw_plan_d_state(obs_msg)
+        if state_np.shape[0] != 43:
+            self.get_logger().warn(
+                f"Visual-servo state dim {state_np.shape[0]} != 43; skipping."
+            )
+            return None
+        state_tensor = torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            model_output = self.visual_servo_model(image_tensor, state_tensor)[0]
+        if self.visual_servo_target_mode == "xy_direction":
+            logits = model_output.detach().float().view(2, 3).cpu()
+            probs = torch.softmax(logits, dim=1).numpy().astype(np.float64)
+            classes = np.argmax(probs, axis=1)
+            signs = np.array([-1.0, 0.0, 1.0], dtype=np.float64)[classes]
+            self._last_visual_servo_direction_classes = classes.astype(int)
+            self._last_visual_servo_direction_probs = probs
+            pred_si = np.array(
+                [
+                    signs[0] * self.visual_servo_direction_speed_mps,
+                    signs[1] * self.visual_servo_direction_speed_mps,
+                    0.0,
+                ],
+                dtype=np.float64,
+            )
+            return pred_si
+        if self.visual_servo_target_mode == "pixel_delta":
+            if self.visual_servo_pixel_to_base_xy is None:
+                return None
+            pred_px = (
+                model_output.detach().cpu().numpy().astype(np.float64)
+                / self.visual_servo_target_scale
+            )
+            if pred_px.shape[0] < 2 or not np.all(np.isfinite(pred_px[:2])):
+                return None
+            self._last_visual_servo_pixel_delta_px = pred_px[:2].copy()
+            feature = np.array([pred_px[0], pred_px[1], 1.0], dtype=np.float64)
+            xy_error = self.visual_servo_pixel_to_base_xy @ feature
+            if not np.all(np.isfinite(xy_error)):
+                return None
+            pred_si = np.array(
+                [xy_error[0], xy_error[1], self.visual_servo_down_vz_mps],
+                dtype=np.float64,
+            )
+            if float(np.max(np.abs(pred_si[:2]))) > self.visual_servo_max_abs_err_m:
+                return None
+            return pred_si
+        pred_si = (
+            model_output.detach().cpu().numpy().astype(np.float64)
+            / self.visual_servo_target_scale
+        )
+        if not np.all(np.isfinite(pred_si)):
+            return None
+        if (
+            self.visual_servo_target_mode == "delta"
+            and float(np.max(np.abs(pred_si[:2]))) > self.visual_servo_max_abs_err_m
+        ):
+            return None
+        return pred_si
+
+    def prepare_observations(
+        self,
+        obs_msg: Observation,
+        *,
+        norm_source: str = "base",
+    ) -> Dict[str, torch.Tensor]:
         """Convert ROS Observation message into dictionary of normalized tensors."""
+        if norm_source == "insert":
+            if self.insert_img_stats is None:
+                raise RuntimeError("Insertion normalization requested before insertion policy is loaded")
+            img_stats = self.insert_img_stats
+            state_norm_mode = self._insert_state_norm_mode
+            state_mean = self.insert_state_mean
+            state_std = self.insert_state_std
+            state_min = self.insert_state_min
+            state_max = self.insert_state_max
+        elif norm_source == "base":
+            img_stats = self.img_stats
+            state_norm_mode = self._state_norm_mode
+            state_mean = self.state_mean
+            state_std = self.state_std
+            state_min = getattr(self, "state_min", None)
+            state_max = getattr(self, "state_max", None)
+        else:
+            raise ValueError(f"Unsupported normalization source: {norm_source!r}")
 
         # --- Process Cameras ---
         obs = {
@@ -294,22 +789,22 @@ class RunACT(Policy):
                 obs_msg.left_image,
                 self.device,
                 self.image_scaling,
-                self.img_stats["left"]["mean"],
-                self.img_stats["left"]["std"],
+                img_stats["left"]["mean"],
+                img_stats["left"]["std"],
             ),
             "observation.images.center_camera": self._img_to_tensor(
                 obs_msg.center_image,
                 self.device,
                 self.image_scaling,
-                self.img_stats["center"]["mean"],
-                self.img_stats["center"]["std"],
+                img_stats["center"]["mean"],
+                img_stats["center"]["std"],
             ),
             "observation.images.right_camera": self._img_to_tensor(
                 obs_msg.right_image,
                 self.device,
                 self.image_scaling,
-                self.img_stats["right"]["mean"],
-                self.img_stats["right"]["std"],
+                img_stats["right"]["mean"],
+                img_stats["right"]["std"],
             ),
         }
 
@@ -362,14 +857,48 @@ class RunACT(Policy):
         raw_state_tensor = (
             torch.from_numpy(state_np).float().unsqueeze(0).to(self.device)
         )
-        if self._state_norm_mode == "MEAN_STD":
-            obs["observation.state"] = (raw_state_tensor - self.state_mean) / self.state_std
+        if state_norm_mode == "MEAN_STD":
+            obs["observation.state"] = (raw_state_tensor - state_mean) / state_std
         else:  # MIN_MAX → [-1, 1]
             obs["observation.state"] = (
-                2 * (raw_state_tensor - self.state_min) / (self.state_max - self.state_min) - 1
+                2
+                * (raw_state_tensor - state_min)
+                / self._safe_denominator(state_max - state_min)
+                - 1
             )
 
         return obs
+
+    def _unnormalize_action_tensor(
+        self,
+        normalized_action: torch.Tensor,
+        *,
+        norm_source: str = "base",
+    ) -> torch.Tensor:
+        if norm_source == "insert":
+            action_norm_mode = self._insert_action_norm_mode
+            action_mean = self.insert_action_mean
+            action_std = self.insert_action_std
+            action_min = self.insert_action_min
+            action_max = self.insert_action_max
+        elif norm_source == "base":
+            action_norm_mode = self._action_norm_mode
+            action_mean = self.action_mean
+            action_std = self.action_std
+            action_min = getattr(self, "action_min", None)
+            action_max = getattr(self, "action_max", None)
+        else:
+            raise ValueError(f"Unsupported normalization source: {norm_source!r}")
+
+        if action_norm_mode == "MEAN_STD":
+            return (normalized_action * action_std) + action_mean
+        # MIN_MAX from [-1, 1]
+        return (
+            (normalized_action + 1)
+            / 2
+            * self._safe_denominator(action_max - action_min)
+            + action_min
+        )
 
     def insert_cable(
         self,
@@ -395,11 +924,13 @@ class RunACT(Policy):
           gravity_compensation_action; no feedforward needed in MotionUpdate.
         """
         self.policy.reset()
+        if self.insert_policy is not None:
+            self.insert_policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
 
         # Build the task identity one-hot exactly as record_dataset.py does for
         # training data. Stays at zeros for Plan B (state dim 26) checkpoints.
-        if self._state_includes_wrench_and_task:
+        if self._state_includes_wrench_and_task or self.visual_servo_model is not None:
             self.current_task_vec = encode_task(
                 task.target_module_name, task.port_name, task.plug_type
             )
@@ -464,13 +995,35 @@ class RunACT(Policy):
         trial_start = self.time_now()
         loop_count = 0
         peak_force = 0.0
+        final_search_started_at = None
+        final_search_anchor_pose = None
+        insert_policy_active = False
 
-        while (self.time_now() - trial_start).nanoseconds * 1e-9 < 30.0:
+        while (self.time_now() - trial_start).nanoseconds * 1e-9 < self.max_trial_s:
             loop_start = self.time_now()
             observation_msg = get_observation()
             if observation_msg is None:
                 self.sleep_for(self.LOOP_DT)
                 continue
+
+            trial_elapsed_s = (loop_start - trial_start).nanoseconds * 1e-9
+            if (
+                self.dagger_cheatcode_handoff_enabled
+                and trial_elapsed_s >= self.dagger_cheatcode_handoff_s
+            ):
+                self.get_logger().warn(
+                    f"DAGGER_CHEATCODE_HANDOFF at t={trial_elapsed_s:.2f}s; "
+                    "delegating final alignment/insertion to CheatCode"
+                )
+                from aic_example_policies.ros.CheatCode import CheatCode
+
+                teacher = CheatCode(self._parent_node)
+                return teacher.insert_cable(
+                    task=task,
+                    get_observation=get_observation,
+                    move_robot=move_robot,
+                    send_feedback=send_feedback,
+                )
 
             # Inference. policy.select_action() returns one un-normalized-space action
             # per call. ACT: 1 inference per tick (n_action_steps=1). Diffusion: 1
@@ -479,10 +1032,7 @@ class RunACT(Policy):
             obs_tensors = self.prepare_observations(observation_msg)
             with torch.inference_mode():
                 normalized_action = self.policy.select_action(obs_tensors)
-            if self._action_norm_mode == "MEAN_STD":
-                raw_action_tensor = (normalized_action * self.action_std) + self.action_mean
-            else:  # MIN_MAX from [-1, 1]
-                raw_action_tensor = (normalized_action + 1) / 2 * (self.action_max - self.action_min) + self.action_min
+            raw_action_tensor = self._unnormalize_action_tensor(normalized_action)
             scaled_action_tensor = raw_action_tensor * self.ACTION_SCALE
             raw_action = raw_action_tensor[0].cpu().numpy()
             action = scaled_action_tensor[0].cpu().numpy()
@@ -543,6 +1093,184 @@ class RunACT(Policy):
                             mode_label = "BACKOFF"
                 else:
                     force_above_since = None
+
+                trial_elapsed_s = (sim_now - trial_start).nanoseconds * 1e-9
+                if (
+                    mode_label != "BACKOFF"
+                    and self.insert_policy is not None
+                    and trial_elapsed_s >= self.insert_policy_start_s
+                ):
+                    if not insert_policy_active:
+                        self.insert_policy.reset()
+                        insert_policy_active = True
+                        self.get_logger().warn(
+                            f"INSERT_ACT start at t={trial_elapsed_s:.2f}s"
+                        )
+                    with torch.inference_mode():
+                        insert_obs_tensors = self.prepare_observations(
+                            observation_msg,
+                            norm_source="insert",
+                        )
+                        normalized_insert_action = self.insert_policy.select_action(insert_obs_tensors)
+                    insert_action_tensor = (
+                        self._unnormalize_action_tensor(
+                            normalized_insert_action,
+                            norm_source="insert",
+                        )
+                        * self.ACTION_SCALE
+                    )
+                    insert_action = insert_action_tensor[0].cpu().numpy()[:6].copy()
+                    if self.insert_policy_mode == "xy_down":
+                        action_used = action[:6].copy()
+                        xy_action = insert_action[:2] * self.insert_policy_xy_gain
+                        xy_norm = float(np.linalg.norm(xy_action))
+                        if xy_norm > self.insert_policy_max_xy_speed_mps:
+                            xy_action *= self.insert_policy_max_xy_speed_mps / xy_norm
+                        action_used[0] = xy_action[0]
+                        action_used[1] = xy_action[1]
+                        action_used[2] = self.insert_policy_down_vz_mps
+                    else:
+                        action_used = insert_action
+                        lin_norm = float(np.linalg.norm(action_used[:3]))
+                        if lin_norm > self.insert_policy_max_lin_speed_mps:
+                            action_used[:3] *= self.insert_policy_max_lin_speed_mps / lin_norm
+                    mode_label = f"INSERT_{self.insert_policy_mode.upper()}"
+
+                visual_servo_output_si = None
+                visual_servo_debug = ""
+                if (
+                    mode_label != "BACKOFF"
+                    and self.visual_servo_model is not None
+                    and trial_elapsed_s >= self.visual_servo_start_s
+                ):
+                    visual_servo_output_si = self._predict_visual_servo_output_si(observation_msg)
+                    if visual_servo_output_si is not None:
+                        if self.visual_servo_target_mode in {"action_linear", "xy_direction"}:
+                            xy_command = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                            xy_error_norm = float(np.linalg.norm(xy_command))
+                            xy_step = xy_command * self.visual_servo_gain
+                        else:
+                            xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                            xy_error_norm = float(np.linalg.norm(xy_error))
+                            xy_step = xy_error * self.visual_servo_gain
+                        xy_step_norm = float(np.linalg.norm(xy_step))
+                        if xy_step_norm > self.visual_servo_max_xy_speed_mps:
+                            xy_step *= self.visual_servo_max_xy_speed_mps / xy_step_norm
+
+                        action_used = action[:6].copy()
+                        action_used[0] = xy_step[0]
+                        action_used[1] = xy_step[1]
+                        if self.visual_servo_target_mode == "action_linear":
+                            pred_z = float(visual_servo_output_si[2] * self.visual_servo_gain)
+                            pred_z = float(
+                                np.clip(
+                                    pred_z,
+                                    -self.visual_servo_max_z_speed_mps,
+                                    self.visual_servo_max_z_speed_mps,
+                                )
+                            )
+                        else:
+                            pred_z = self.visual_servo_down_vz_mps
+                        if self.visual_servo_z_mode == "hold":
+                            action_used[2] = 0.0
+                        elif self.visual_servo_z_mode == "down":
+                            action_used[2] = self.visual_servo_down_vz_mps
+                        elif self.visual_servo_z_mode == "gate_down":
+                            action_used[2] = (
+                                self.visual_servo_down_vz_mps
+                                if xy_error_norm <= self.visual_servo_descend_xy_gate_m
+                                else 0.0
+                            )
+                        elif self.visual_servo_z_mode == "gate_act_down":
+                            if xy_error_norm <= self.visual_servo_descend_xy_gate_m:
+                                action_used[2] = self.visual_servo_down_vz_mps
+                        elif self.visual_servo_z_mode == "pred":
+                            action_used[2] = pred_z
+                        elif self.visual_servo_z_mode == "gate_pred":
+                            if xy_error_norm <= self.visual_servo_descend_xy_gate_m:
+                                action_used[2] = pred_z
+                        if self.visual_servo_target_mode == "xy_direction":
+                            classes = self._last_visual_servo_direction_classes
+                            probs = self._last_visual_servo_direction_probs
+                            max_probs = (
+                                np.max(probs, axis=1).round(2).tolist()
+                                if probs is not None
+                                else []
+                            )
+                            visual_servo_debug = (
+                                " vs_dir_cls="
+                                f"{classes.tolist() if classes is not None else []}"
+                                " vs_dir_p="
+                                f"{max_probs}"
+                                " vs_xy_used_mmps="
+                                f"{np.round(xy_step * 1000.0, 1).tolist()}"
+                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm/s"
+                            )
+                        elif self.visual_servo_target_mode == "pixel_delta":
+                            xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                            visual_servo_debug = (
+                                " vs_px_delta="
+                                f"{np.round(self._last_visual_servo_pixel_delta_px, 1).tolist()}"
+                                " vs_xy_used_mm="
+                                f"{np.round(xy_error * 1000.0, 1).tolist()}"
+                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
+                            )
+                        elif self.visual_servo_target_mode == "action_linear":
+                            visual_servo_debug = (
+                                " vs_action_mmps="
+                                f"{np.round(visual_servo_output_si[:3] * 1000.0, 1).tolist()}"
+                                " vs_xy_used_mmps="
+                                f"{np.round(xy_step * 1000.0, 1).tolist()}"
+                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm/s"
+                            )
+                        else:
+                            xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                            visual_servo_debug = (
+                                " vs_pred_mm="
+                                f"{np.round(visual_servo_output_si[:3] * 1000.0, 1).tolist()}"
+                                " vs_xy_used_mm="
+                                f"{np.round(xy_error * 1000.0, 1).tolist()}"
+                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
+                            )
+                        mode_label = "VISUAL_SERVO"
+
+                if (
+                    mode_label != "BACKOFF"
+                    and self.final_search_enabled
+                    and trial_elapsed_s >= self.final_search_start_s
+                ):
+                    if final_search_started_at is None:
+                        final_search_started_at = sim_now
+                        final_search_anchor_pose = observation_msg.controller_state.tcp_pose
+                        self.get_logger().warn(
+                            f"FINAL_SEARCH start at t={trial_elapsed_s:.2f}s "
+                            f"anchor=({final_search_anchor_pose.position.x:.4f}, "
+                            f"{final_search_anchor_pose.position.y:.4f}, "
+                            f"{final_search_anchor_pose.position.z:.4f})"
+                        )
+
+                    t_search_s = (sim_now - final_search_started_at).nanoseconds * 1e-9
+                    radius = min(
+                        self.final_search_max_radius_m,
+                        self.final_search_growth_mps * t_search_s,
+                    )
+                    theta = 2.0 * np.pi * t_search_s / max(self.final_search_period_s, 1e-3)
+                    desired_x = final_search_anchor_pose.position.x + radius * np.cos(theta)
+                    desired_y = final_search_anchor_pose.position.y + radius * np.sin(theta)
+                    dx = desired_x - last_target_pose.position.x
+                    dy = desired_y - last_target_pose.position.y
+                    xy_step = np.array([dx, dy], dtype=np.float64) / self.LOOP_DT
+                    xy_norm = float(np.linalg.norm(xy_step))
+                    if xy_norm > self.final_search_max_xy_speed_mps:
+                        xy_step *= self.final_search_max_xy_speed_mps / xy_norm
+
+                    # Preserve ACT's small orientation corrections, but take over
+                    # translational insertion. Force backoff still has priority.
+                    action_used = action[:6].copy()
+                    action_used[0] = xy_step[0]
+                    action_used[1] = xy_step[1]
+                    action_used[2] = self.final_search_down_vz_mps
+                    mode_label = "FINAL_SEARCH"
 
             # Build & publish target.
             if self.USE_POSITION_MODE:
@@ -606,6 +1334,7 @@ class RunACT(Policy):
                     f"act={action_used.round(4).tolist()} "
                     f"F={force_mag:.1f}N peak={peak_force:.1f}N "
                     f"d_t2a={dist_t2a*1000:.1f}mm mode={mode_label}"
+                    f"{visual_servo_debug}"
                 )
             loop_count += 1
 

@@ -15,6 +15,8 @@
 #
 
 
+import os
+
 import numpy as np
 
 from aic_model.policy import (
@@ -38,9 +40,50 @@ class CheatCode(Policy):
     def __init__(self, parent_node):
         self._tip_x_error_integrator = 0.0
         self._tip_y_error_integrator = 0.0
-        self._max_integrator_windup = 0.05
+        self._max_integrator_windup = float(
+            os.environ.get("AIC_CHEATCODE_MAX_INTEGRATOR_WINDUP_M", "0.05")
+        )
+        self._xy_i_gain = float(os.environ.get("AIC_CHEATCODE_XY_I_GAIN", "0.15"))
+        self._xy_dither_amp_m = float(
+            os.environ.get("AIC_CHEATCODE_XY_DITHER_AMP_M", "0.0")
+        )
+        self._xy_dither_period_s = float(
+            os.environ.get("AIC_CHEATCODE_XY_DITHER_PERIOD_S", "2.5")
+        )
+        self._xy_offset_max_m = float(
+            os.environ.get("AIC_CHEATCODE_XY_OFFSET_MAX_M", "0.0")
+        )
+        self._xy_offset_decay_start_m = float(
+            os.environ.get("AIC_CHEATCODE_XY_OFFSET_DECAY_START_M", "0.08")
+        )
+        self._xy_offset_decay_end_m = float(
+            os.environ.get("AIC_CHEATCODE_XY_OFFSET_DECAY_END_M", "0.01")
+        )
+        self._descent_step_m = float(
+            os.environ.get("AIC_CHEATCODE_DESCENT_STEP_M", "0.0005")
+        )
+        seed_raw = os.environ.get("AIC_CHEATCODE_XY_OFFSET_SEED", "").strip()
+        self._offset_rng = (
+            np.random.default_rng(int(seed_raw))
+            if seed_raw
+            else np.random.default_rng()
+        )
         self._task = None
         super().__init__(parent_node)
+        if (
+            self._xy_i_gain != 0.15
+            or self._xy_dither_amp_m > 0.0
+            or self._xy_offset_max_m > 0.0
+            or self._descent_step_m != 0.0005
+        ):
+            self.get_logger().warn(
+                "Training-only CheatCode alignment enrichment enabled: "
+                f"xy_i_gain={self._xy_i_gain:.3f} "
+                f"windup={self._max_integrator_windup:.3f}m "
+                f"dither={self._xy_dither_amp_m * 1000:.1f}mm "
+                f"offset_max={self._xy_offset_max_m * 1000:.1f}mm "
+                f"descent_step={self._descent_step_m * 1000:.2f}mm"
+            )
 
     def _wait_for_tf(
         self, target_frame: str, source_frame: str, timeout_sec: float = 10.0
@@ -76,6 +119,7 @@ class CheatCode(Policy):
         position_fraction: float = 1.0,
         z_offset: float = 0.1,
         reset_xy_integrator: bool = False,
+        xy_offset: tuple[float, float] = (0.0, 0.0),
     ) -> Pose:
         """Find the gripper pose that results in plug alignment."""
         q_port = (
@@ -158,10 +202,15 @@ class CheatCode(Policy):
             f"pfrac: {position_fraction:.3} xy_error: {tip_x_error:0.3} {tip_y_error:0.3}   integrators: {self._tip_x_error_integrator:.3} , {self._tip_y_error_integrator:.3}"
         )
 
-        i_gain = 0.15
+        i_gain = self._xy_i_gain
 
-        target_x = port_xy[0] + i_gain * self._tip_x_error_integrator
-        target_y = port_xy[1] + i_gain * self._tip_y_error_integrator
+        target_x = port_xy[0] + xy_offset[0] + i_gain * self._tip_x_error_integrator
+        target_y = port_xy[1] + xy_offset[1] + i_gain * self._tip_y_error_integrator
+        if self._xy_dither_amp_m > 0.0 and not reset_xy_integrator:
+            t = self.time_now().nanoseconds * 1e-9
+            theta = 2.0 * np.pi * t / max(self._xy_dither_period_s, 1e-3)
+            target_x += self._xy_dither_amp_m * np.cos(theta)
+            target_y += self._xy_dither_amp_m * np.sin(theta)
         target_z = port_transform.translation.z + z_offset - plug_tip_gripper_offset[2]
 
         blend_xyz = (
@@ -215,6 +264,19 @@ class CheatCode(Policy):
         port_transform = port_tf_stamped.transform
 
         z_offset = 0.2
+        xy_offset = (0.0, 0.0)
+        if self._xy_offset_max_m > 0.0:
+            # Training-only exploration: start final insertion with a deliberate
+            # lateral error, then decay it to zero while descending. This creates
+            # directionally useful alignment labels without using ground truth at
+            # runtime.
+            angle = float(self._offset_rng.uniform(0.0, 2.0 * np.pi))
+            radius = float(self._offset_rng.uniform(0.35, 1.0) * self._xy_offset_max_m)
+            xy_offset = (radius * np.cos(angle), radius * np.sin(angle))
+            self.get_logger().warn(
+                "CheatCode xy offset episode: "
+                f"dx={xy_offset[0] * 1000:.1f}mm dy={xy_offset[1] * 1000:.1f}mm"
+            )
 
         # Over five seconds, smoothly interpolate from the current position to
         # a position above the port.
@@ -229,6 +291,7 @@ class CheatCode(Policy):
                         position_fraction=interp_fraction,
                         z_offset=z_offset,
                         reset_xy_integrator=True,
+                        xy_offset=xy_offset,
                     ),
                 )
             except TransformException as ex:
@@ -240,12 +303,29 @@ class CheatCode(Policy):
             if z_offset < -0.015:
                 break
 
-            z_offset -= 0.0005
+            z_offset -= self._descent_step_m
             self.get_logger().info(f"z_offset: {z_offset:0.5}")
             try:
+                decay_span = max(
+                    self._xy_offset_decay_start_m - self._xy_offset_decay_end_m,
+                    1e-6,
+                )
+                offset_fraction = np.clip(
+                    (z_offset - self._xy_offset_decay_end_m) / decay_span,
+                    0.0,
+                    1.0,
+                )
+                decayed_xy_offset = (
+                    xy_offset[0] * offset_fraction,
+                    xy_offset[1] * offset_fraction,
+                )
                 self.set_pose_target(
                     move_robot=move_robot,
-                    pose=self.calc_gripper_pose(port_transform, z_offset=z_offset),
+                    pose=self.calc_gripper_pose(
+                        port_transform,
+                        z_offset=z_offset,
+                        xy_offset=decayed_xy_offset,
+                    ),
                 )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insertion: {ex}")

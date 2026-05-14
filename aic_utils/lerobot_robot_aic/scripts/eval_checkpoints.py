@@ -29,6 +29,7 @@ import numpy as np
 import torch
 from safetensors.torch import load_file
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.act.configuration_act import ACTConfig
@@ -39,6 +40,11 @@ from lerobot.policies.diffusion.modeling_diffusion import DiffusionPolicy
 ACTION_DIM_NAMES = ["lin_x", "lin_y", "lin_z", "ang_x", "ang_y", "ang_z", "pad"]
 ACTION_DIM_UNITS = ["mm_s", "mm_s", "mm_s", "deg_s", "deg_s", "deg_s", "raw"]
 ACTION_DIM_SCALE = [1000.0, 1000.0, 1000.0, 180.0 / np.pi, 180.0 / np.pi, 180.0 / np.pi, 1.0]
+NORM_EPS = 1e-6
+
+
+def safe_denominator(t: torch.Tensor) -> torch.Tensor:
+    return torch.where(t.abs() < NORM_EPS, torch.full_like(t, NORM_EPS), t)
 
 
 def find_checkpoints(ckpt_dir: Path) -> list[tuple[int, Path]]:
@@ -97,7 +103,7 @@ def load_policy_and_stats(pretrained: Path, device: torch.device):
     }
     if norm["state_norm_mode"] == "MEAN_STD":
         norm["state_mean"] = stats["observation.state.mean"].to(device).view(1, -1)
-        norm["state_std"] = stats["observation.state.std"].to(device).view(1, -1)
+        norm["state_std"] = safe_denominator(stats["observation.state.std"].to(device).view(1, -1))
     elif norm["state_norm_mode"] == "MIN_MAX":
         norm["state_min"] = stats["observation.state.min"].to(device).view(1, -1)
         norm["state_max"] = stats["observation.state.max"].to(device).view(1, -1)
@@ -121,7 +127,9 @@ def normalize_batch(batch: dict, norm: dict, device: torch.device) -> dict:
     if norm["state_norm_mode"] == "MEAN_STD":
         out["observation.state"] = (state - norm["state_mean"]) / norm["state_std"]
     elif norm["state_norm_mode"] == "MIN_MAX":
-        out["observation.state"] = 2 * (state - norm["state_min"]) / (norm["state_max"] - norm["state_min"]) - 1
+        out["observation.state"] = 2 * (state - norm["state_min"]) / safe_denominator(
+            norm["state_max"] - norm["state_min"]
+        ) - 1
     else:
         out["observation.state"] = state
 
@@ -134,7 +142,7 @@ def normalize_batch(batch: dict, norm: dict, device: torch.device) -> dict:
         # LeRobotDataset returns uint8 [0..255] for video features; normalize to [0,1] first.
         if img.max() > 1.5:
             img = img / 255.0
-        out[cam_key] = (img - norm[m_key]) / norm[s_key]
+        out[cam_key] = (img - norm[m_key]) / safe_denominator(norm[s_key])
     return out
 
 
@@ -221,6 +229,12 @@ def main():
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--max-frames", type=int, default=600, help="Cap eval frames per checkpoint.")
+    p.add_argument(
+        "--tail-frames",
+        type=int,
+        default=None,
+        help="Evaluate only the last N frames of each selected episode.",
+    )
     p.add_argument("--device", default="cuda")
     p.add_argument("--wandb-project", default=None)
     p.add_argument("--wandb-entity", default=None)
@@ -239,6 +253,25 @@ def main():
         video_backend=args.video_backend,
     )
     print(f"  {ds.num_episodes} episodes, {ds.num_frames} frames")
+
+    if args.tail_frames is not None:
+        if args.tail_frames <= 0:
+            raise ValueError("--tail-frames must be positive")
+        episode_indices = (
+            list(args.val_episodes)
+            if args.val_episodes is not None
+            else list(range(ds.meta.total_episodes))
+        )
+        tail_indices = []
+        compact_start = 0
+        for ep_idx in episode_indices:
+            length = int(ds.meta.episodes["length"][ep_idx])
+            compact_end = compact_start + length
+            tail_start = max(compact_start, compact_end - args.tail_frames)
+            tail_indices.extend(range(tail_start, compact_end))
+            compact_start = compact_end
+        ds = Subset(ds, tail_indices)
+        print(f"  tail eval: last {args.tail_frames} frames/episode -> {len(ds)} frames")
 
     loader = DataLoader(
         ds,

@@ -1,0 +1,38 @@
+services:
+  eval:
+    command: gazebo_gui:=false launch_rviz:=false ground_truth:=true start_aic_engine:=true shutdown_on_aic_engine_exit:=true model_discovery_timeout_seconds:=600 aic_engine_config_file:=/tmp/aic_random_trials.yaml
+    volumes:
+      - ${AIC_VISUAL_LABEL_TRIALS_CONFIG:-${PWD}/aic_engine/config/random_trials_visual_servo_40.yaml}:/tmp/aic_random_trials.yaml:ro
+  model:
+    environment:
+      AIC_POLICY_PLAN: d
+      AIC_DAGGER_CHEATCODE_HANDOFF: "1"
+      AIC_DAGGER_CHEATCODE_HANDOFF_S: ${AIC_DAGGER_CHEATCODE_HANDOFF_S:-8.0}
+      AIC_CHEATCODE_XY_I_GAIN: ${AIC_CHEATCODE_XY_I_GAIN:-0.25}
+      AIC_CHEATCODE_MAX_INTEGRATOR_WINDUP_M: ${AIC_CHEATCODE_MAX_INTEGRATOR_WINDUP_M:-0.05}
+      AIC_CHEATCODE_XY_DITHER_AMP_M: ${AIC_CHEATCODE_XY_DITHER_AMP_M:-0.0}
+      AIC_CHEATCODE_XY_OFFSET_MAX_M: ${AIC_CHEATCODE_XY_OFFSET_MAX_M:-0.015}
+      AIC_CHEATCODE_XY_OFFSET_DECAY_START_M: ${AIC_CHEATCODE_XY_OFFSET_DECAY_START_M:-0.08}
+      AIC_CHEATCODE_XY_OFFSET_DECAY_END_M: ${AIC_CHEATCODE_XY_OFFSET_DECAY_END_M:-0.01}
+      AIC_CHEATCODE_DESCENT_STEP_M: ${AIC_CHEATCODE_DESCENT_STEP_M:-0.00025}
+  recorder:
+    image: aic-runact:plans-bc
+    entrypoint:
+      - /bin/bash
+      - /tmp/record_visual_labels.sh
+    environment:
+      AIC_ROUTER_ADDR: eval:7447
+      AIC_VISUAL_LABEL_ROOT: ${AIC_VISUAL_LABEL_ROOT:-/data/vision_servo_labels}
+      AIC_VISUAL_LABEL_EPISODES: ${AIC_VISUAL_LABEL_EPISODES:-20}
+      AIC_VISUAL_LABEL_MIN_FRAME_INDEX: ${AIC_VISUAL_LABEL_MIN_FRAME_INDEX:-120}
+      AIC_VISUAL_LABEL_SAMPLE_EVERY: ${AIC_VISUAL_LABEL_SAMPLE_EVERY:-2}
+      AIC_VISUAL_LABEL_IMAGE_SCALE: ${AIC_VISUAL_LABEL_IMAGE_SCALE:-0.5}
+      AIC_VISUAL_LABEL_CAMERAS: ${AIC_VISUAL_LABEL_CAMERAS:-center}
+      AIC_VISUAL_LABEL_REQUIRE_VISIBLE: ${AIC_VISUAL_LABEL_REQUIRE_VISIBLE:-center}
+      AIC_VISUAL_LABEL_JPEG_QUALITY: ${AIC_VISUAL_LABEL_JPEG_QUALITY:-90}
+      AIC_VISUAL_LABEL_MAX_LABELS_PER_EPISODE: ${AIC_VISUAL_LABEL_MAX_LABELS_PER_EPISODE:-0}
+    volumes:
+      - ${AIC_VISUAL_LABEL_TRIALS_CONFIG:-${PWD}/aic_engine/config/random_trials_visual_servo_40.yaml}:/tmp/aic_random_trials.yaml:ro
+      - ${PWD}/aic_utils/lerobot_robot_aic/scripts/record_visual_servo_dataset.py:/tmp/record_visual_servo_dataset.py:ro
+      - ${PWD}/outputs/experiments/vision_servo_labels/record_visual_labels.sh:/tmp/record_visual_labels.sh:ro
+      - ${PWD}/outputs/experiments/vision_servo_labels/data:/data

@@ -1,0 +1,57 @@
+# Self-contained image for ECR submission.
+# Config: planE_pixel — Plan E REPLACE mode with the pixel_delta visual-servo
+# head. Local 3-run results: 110.54 / 124.03 / 139.02 (mean 124.5, max 139.02
+# included a partial-insertion trial 2). High variance vs Plan D 123 but the
+# only config tonight that broke past 130.
+#
+# Build:
+#   docker build -t aic-runact:plane-pixel-v1 -f docker/aic_model/Dockerfile.planE_pixel .
+#
+# Tag + push (replace <team_name>):
+#   docker tag aic-runact:plane-pixel-v1 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/<team_name>:plane-pixel-v1
+#   docker push 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/<team_name>:plane-pixel-v1
+
+FROM aic-runact:plans-bc
+
+# Bake the pixel_delta visual-servo model at /opt/visual_servo so the policy
+# can find it without a host-volume mount (the eval cluster's network is
+# internal=true and cannot reach host bind mounts).
+COPY outputs/experiments/vision_servo_labels/models/visual_pixel_delta_balanced20_o25_s2 /opt/visual_servo
+
+# Wrap the base entrypoint with one that FORCES the planE_pixel env vars even
+# if a parent compose passes empty overrides via `environment:` blocks. This
+# makes the image self-configuring whether the eval runs it via plain
+# `docker run` (ECR cluster) or via a compose file (local testing).
+COPY --chmod=755 <<"EOF" /entrypoint_planE_pixel.sh
+#!/bin/bash
+set -e
+# Force-set the planE_pixel config. These overrides win against compose env:
+# substitutions that pass empty strings.
+export AIC_POLICY_PLAN=d
+export AIC_VISUAL_SERVO_MODEL_PATH=/opt/visual_servo/best_visual_servo.pt
+export AIC_VISUAL_SERVO_START_S=9.0
+export AIC_VISUAL_SERVO_GAIN=0.75
+export AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.006
+export AIC_VISUAL_SERVO_MAX_Z_SPEED_MPS=0.020
+export AIC_VISUAL_SERVO_DOWN_VZ_MPS=-0.006
+export AIC_VISUAL_SERVO_Z_MODE=act
+export AIC_VISUAL_SERVO_DESCEND_XY_GATE_M=0.010
+export AIC_VISUAL_SERVO_MAX_ABS_ERR_M=0.050
+export AIC_VISUAL_SERVO_X_SIGN=1.0
+export AIC_VISUAL_SERVO_Y_SIGN=1.0
+export AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+export AIC_VISUAL_SERVO_ASSIST_MODE=0
+export AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+export AIC_VISUAL_SERVO_Z_STIFFNESS=0.0
+export AIC_VISUAL_SERVO_Z_DAMPING=100.0
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+echo "planE_pixel entrypoint: forced config baked into env"
+echo "  AIC_VISUAL_SERVO_MODEL_PATH=$AIC_VISUAL_SERVO_MODEL_PATH"
+echo "  AIC_VISUAL_SERVO_ASSIST_MODE=$AIC_VISUAL_SERVO_ASSIST_MODE (0=REPLACE)"
+echo "  AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=$AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_planE_pixel.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

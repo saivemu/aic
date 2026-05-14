@@ -1,0 +1,54 @@
+# Self-contained image for ECR submission — SAFER alternative.
+# Config: assist_pixel_zstiff — ASSIST mode (ADD pixel_delta to ACT's xy)
+# + xy_max=10mm/s + z-stiffness boost 500 N/m during VS_ASSIST.
+# Local 5-run results: 127.25 / 127.49 / 127.67 / 128.03 / 128.41
+# (mean 127.77, max 128.41, tight 1.16 pt spread). +4.7 over Plan D 123.06.
+# Lower ceiling than planE_pixel (max 128 vs 139) but much tighter variance,
+# so the *expected* score is higher on a single cluster run.
+#
+# Build:
+#   docker build -t aic-runact:assist-pixel-zstiff-v1 -f docker/aic_model/Dockerfile.assist_pixel_zstiff .
+#
+# Tag + push (replace <team_name>):
+#   docker tag aic-runact:assist-pixel-zstiff-v1 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/<team_name>:assist-pixel-zstiff-v1
+#   docker push 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/<team_name>:assist-pixel-zstiff-v1
+
+FROM aic-runact:plans-bc
+
+# Same pixel_delta visual-servo head as planE_pixel; the difference is
+# entirely in how its output is used at runtime (ASSIST add vs REPLACE).
+COPY outputs/experiments/vision_servo_labels/models/visual_pixel_delta_balanced20_o25_s2 /opt/visual_servo
+
+COPY --chmod=755 <<"EOF" /entrypoint_assist_pixel_zstiff.sh
+#!/bin/bash
+set -e
+# Force-set config; overrides compose's empty `${VAR:-}` defaults.
+export AIC_POLICY_PLAN=d
+export AIC_VISUAL_SERVO_MODEL_PATH=/opt/visual_servo/best_visual_servo.pt
+export AIC_VISUAL_SERVO_START_S=9.0
+export AIC_VISUAL_SERVO_GAIN=0.75
+export AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.010
+export AIC_VISUAL_SERVO_MAX_Z_SPEED_MPS=0.020
+export AIC_VISUAL_SERVO_DOWN_VZ_MPS=-0.006
+export AIC_VISUAL_SERVO_Z_MODE=act
+export AIC_VISUAL_SERVO_DESCEND_XY_GATE_M=0.010
+export AIC_VISUAL_SERVO_MAX_ABS_ERR_M=0.050
+export AIC_VISUAL_SERVO_X_SIGN=1.0
+export AIC_VISUAL_SERVO_Y_SIGN=1.0
+export AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+export AIC_VISUAL_SERVO_ASSIST_MODE=1
+export AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+export AIC_VISUAL_SERVO_Z_STIFFNESS=500.0
+export AIC_VISUAL_SERVO_Z_DAMPING=100.0
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+echo "assist_pixel_zstiff entrypoint: forced config baked into env"
+echo "  AIC_VISUAL_SERVO_MODEL_PATH=$AIC_VISUAL_SERVO_MODEL_PATH"
+echo "  AIC_VISUAL_SERVO_ASSIST_MODE=$AIC_VISUAL_SERVO_ASSIST_MODE (1=ADD)"
+echo "  AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=$AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS"
+echo "  AIC_VISUAL_SERVO_Z_STIFFNESS=$AIC_VISUAL_SERVO_Z_STIFFNESS"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_assist_pixel_zstiff.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

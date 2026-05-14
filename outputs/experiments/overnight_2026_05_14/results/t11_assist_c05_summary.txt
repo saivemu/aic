@@ -1,0 +1,25 @@
+=== t11_assist_c05 :: 2026-05-14T02:08:49-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_t11_assist_c05.env
+# T1.1 ASSIST mode with moderate confidence threshold 0.5.
+# Earlier 0.75 was too strict (gated ~70% of ticks); test if 0.5 lets
+# the classifier add useful corrections to Plan D's xy.
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=1
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.5
+AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.006
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+---
+>>> t11_assist_c05 run 1/3 starting at 2026-05-14T02:08:49-07:00
+  run 1: score=122.233 (exit=0)
+>>> t11_assist_c05 run 2/3 starting at 2026-05-14T02:10:57-07:00
+  run 2: score=123.484 (exit=0)
+>>> t11_assist_c05 run 3/3 starting at 2026-05-14T02:13:07-07:00
+  run 3: score=122.995 (exit=0)
+---
+all_scores: 122.233 123.484 122.995
+min=122.233 mean=122.904 max=123.484 n=3
+=== t11_assist_c05 done :: 2026-05-14T02:15:17-07:00 ===

@@ -1,0 +1,5 @@
+# Override the model image to use the self-contained planE_pixel build.
+# No env block — let the Dockerfile's ENV defaults flow through.
+services:
+  model:
+    image: aic-runact:plane-pixel-v1

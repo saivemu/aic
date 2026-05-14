@@ -1,0 +1,23 @@
+=== planE_control :: 2026-05-14T01:47:25-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_planE_control.env
+# Plan E legacy REPLACE mode — control / fallback baseline.
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=0
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.006
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+---
+>>> planE_control run 1/3 starting at 2026-05-14T01:47:25-07:00
+  run 1: score=124.125 (exit=0)
+>>> planE_control run 2/3 starting at 2026-05-14T01:49:29-07:00
+  run 2: score=125.866 (exit=0)
+>>> planE_control run 3/3 starting at 2026-05-14T01:51:40-07:00
+  run 3: score=122.262 (exit=0)
+---
+all_scores: 124.125 125.866 122.262
+min=122.262 mean=124.084 max=125.866 n=3
+=== planE_control done :: 2026-05-14T01:53:47-07:00 ===

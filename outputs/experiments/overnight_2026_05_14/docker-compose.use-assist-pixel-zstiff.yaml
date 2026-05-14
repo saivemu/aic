@@ -1,0 +1,3 @@
+services:
+  model:
+    image: aic-runact:assist-pixel-zstiff-v1

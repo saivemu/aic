@@ -424,8 +424,29 @@ class RunACT(Policy):
         self.visual_servo_direction_speed_mps = float(
             os.environ.get("AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS", "0.006")
         )
+        # Optional z-stiffness override during VISUAL_SERVO / VS_ASSIST modes.
+        # 0 = default (90 N/m); set to e.g. 500-1500 to let the visual servo
+        # push the gripper down harder when xy alignment is improving.
+        self.visual_servo_z_stiffness = float(
+            os.environ.get("AIC_VISUAL_SERVO_Z_STIFFNESS", "0.0")
+        )
+        self.visual_servo_z_damping = float(
+            os.environ.get("AIC_VISUAL_SERVO_Z_DAMPING", "100.0")
+        )
+        # Assist mode: add servo xy as a correction on top of the upstream action
+        # (ACT or insert policy) instead of replacing it. Gated by a per-axis
+        # softmax-confidence minimum for xy_direction; for other target modes
+        # the gate passes unconditionally (continuous heads have no confidence).
+        self.visual_servo_assist_mode = (
+            os.environ.get("AIC_VISUAL_SERVO_ASSIST_MODE", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.visual_servo_confidence_min = float(
+            os.environ.get("AIC_VISUAL_SERVO_CONFIDENCE_MIN", "0.0")
+        )
         self._last_visual_servo_direction_classes = None
         self._last_visual_servo_direction_probs = None
+        self._last_visual_servo_direction_confidence = None
         self._last_visual_servo_pixel_delta_px = None
         self.visual_servo_pixel_to_base_xy = None
         visual_servo_raw = os.environ.get("AIC_VISUAL_SERVO_MODEL_PATH", "").strip()
@@ -497,6 +518,8 @@ class RunACT(Policy):
                 f"z_mode={self.visual_servo_z_mode} "
                 f"descend_gate={self.visual_servo_descend_xy_gate_m * 1000:.1f}mm "
                 f"xy_sign={self.visual_servo_xy_sign.tolist()} "
+                f"assist_mode={'on' if self.visual_servo_assist_mode else 'off'} "
+                f"conf_min={self.visual_servo_confidence_min:.2f} "
                 f"val_xy_mae={metrics.get('mae_xy_norm_mm', float('nan')):.2f}mm"
             )
 
@@ -524,6 +547,133 @@ class RunACT(Policy):
                 f"radius={self.final_search_max_radius_m * 1000:.0f}mm "
                 f"xy_speed={self.final_search_max_xy_speed_mps * 1000:.1f}mm/s "
                 f"vz={self.final_search_down_vz_mps * 1000:.1f}mm/s"
+            )
+
+        # Force-feedback final-descent state machine (T1.2 v2). On entry:
+        # 1) Reset the controller's target pose to current TCP — Plan D often
+        #    leaves the impedance target accumulated up to MAX_TARGET_OFFSET_M
+        #    in the descent direction, leaving the gripper stuck on the board.
+        # 2) LIFT a few mm to clear surface contact.
+        # 3) NAVIGATE in the direction the xy_direction classifier reports
+        #    until the classifier signs go to (0,0) (port found) or budget.
+        # 4) DESCEND slowly listening for a force delta = chamfer caught.
+        # 5) INSERT: keep pushing down past the chamfer until depth target.
+        # YIELDED: hand control back to Plan D unchanged.
+        self.force_descent_enabled = os.environ.get(
+            "AIC_FORCE_DESCENT_ENABLED", ""
+        ).lower() in {"1", "true", "yes", "on"}
+        self.force_descent_start_s = float(
+            os.environ.get("AIC_FORCE_DESCENT_START_S", "12.0")
+        )
+        self.force_descent_budget_s = float(
+            os.environ.get("AIC_FORCE_DESCENT_BUDGET_S", "10.0")
+        )
+        # Δ above tared baseline that we treat as "first contact". Baseline
+        # is the median F_z over the first ~10 ticks after the machine arms.
+        self.force_descent_contact_fz_delta_n = float(
+            os.environ.get("AIC_FORCE_DESCENT_CONTACT_FZ_DELTA_N", "3.0")
+        )
+        # F_z magnitude that aborts back to RECOVER (kept under the 20 N
+        # Tier-2 force penalty to avoid scoring damage).
+        self.force_descent_max_fz_n = float(
+            os.environ.get("AIC_FORCE_DESCENT_MAX_FZ_N", "16.0")
+        )
+        # SEARCH descent rate (gentle, listening for contact).
+        self.force_descent_search_vz_mps = float(
+            os.environ.get("AIC_FORCE_DESCENT_SEARCH_VZ_MPS", "-0.003")
+        )
+        # INSERT descent rate (after chamfer caught, push down through port).
+        self.force_descent_insert_vz_mps = float(
+            os.environ.get("AIC_FORCE_DESCENT_INSERT_VZ_MPS", "-0.004")
+        )
+        # Radius and period for the radial perturbation pattern during SEARCH.
+        # 2 mm matches the SC port hole diameter so we're searching the right
+        # neighborhood.
+        self.force_descent_perturb_radius_m = float(
+            os.environ.get("AIC_FORCE_DESCENT_PERTURB_RADIUS_M", "0.002")
+        )
+        self.force_descent_perturb_period_s = float(
+            os.environ.get("AIC_FORCE_DESCENT_PERTURB_PERIOD_S", "1.5")
+        )
+        # Depth past first-contact Z that declares COMPLETE. SFP/SC ports are
+        # ~8-10 mm deep; we stop short of full insertion to be safe.
+        self.force_descent_complete_depth_m = float(
+            os.environ.get("AIC_FORCE_DESCENT_COMPLETE_DEPTH_M", "0.008")
+        )
+        # If true, only arm the state machine when the visual-servo assist
+        # has reported high confidence for ≥ N consecutive ticks. Without
+        # this gate we risk descending into the wrong location.
+        self.force_descent_require_vs_conf = (
+            os.environ.get("AIC_FORCE_DESCENT_REQUIRE_VS_CONF", "1")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.force_descent_vs_conf_min = float(
+            os.environ.get("AIC_FORCE_DESCENT_VS_CONF_MIN", "0.70")
+        )
+        self.force_descent_vs_conf_ticks = int(
+            os.environ.get("AIC_FORCE_DESCENT_VS_CONF_TICKS", "10")
+        )
+        # Cap commanded xy speed during NAVIGATE so we don't catapult sideways
+        # out of proximity range.
+        self.force_descent_max_xy_speed_mps = float(
+            os.environ.get("AIC_FORCE_DESCENT_MAX_XY_SPEED_MPS", "0.008")
+        )
+        # LIFT state: pull the gripper up briefly to clear contact with the
+        # board surface before navigating.
+        self.force_descent_lift_vz_mps = float(
+            os.environ.get("AIC_FORCE_DESCENT_LIFT_VZ_MPS", "0.010")
+        )
+        self.force_descent_lift_duration_s = float(
+            os.environ.get("AIC_FORCE_DESCENT_LIFT_DURATION_S", "0.5")
+        )
+        # NAVIGATE state: walk in the direction the classifier reports at
+        # this constant speed; continues until the classifier returns
+        # signs=(0,0) for enough ticks OR the navigate budget elapses.
+        self.force_descent_navigate_speed_mps = float(
+            os.environ.get("AIC_FORCE_DESCENT_NAVIGATE_SPEED_MPS", "0.008")
+        )
+        self.force_descent_navigate_max_s = float(
+            os.environ.get("AIC_FORCE_DESCENT_NAVIGATE_MAX_S", "5.0")
+        )
+        self.force_descent_navigate_hold_ticks = int(
+            os.environ.get("AIC_FORCE_DESCENT_NAVIGATE_HOLD_TICKS", "4")
+        )
+        # DESCEND state: max time to keep pushing down without contact.
+        self.force_descent_descend_max_s = float(
+            os.environ.get("AIC_FORCE_DESCENT_DESCEND_MAX_S", "4.0")
+        )
+        # Stiffness override for FD_DESCEND / FD_INSERT. Plan D's default 90 N/m
+        # × 20mm clamp = 1.8 N max spring force, which is not enough to push a
+        # plug past the chamfer. Boost the z stiffness so the controller can
+        # apply ~10-20 N during insertion. Only z is boosted; xy stays compliant
+        # so we don't fight against good Plan D alignment.
+        self.force_descent_z_stiffness = float(
+            os.environ.get("AIC_FORCE_DESCENT_Z_STIFFNESS", "1000.0")
+        )
+        self.force_descent_z_damping = float(
+            os.environ.get("AIC_FORCE_DESCENT_Z_DAMPING", "120.0")
+        )
+        self.force_descent_early_return_disabled = (
+            os.environ.get("AIC_FORCE_DESCENT_NO_EARLY_RETURN", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self.force_descent_enabled:
+            self.get_logger().warn(
+                "Force-descent state machine enabled: "
+                f"start={self.force_descent_start_s:.1f}s "
+                f"budget={self.force_descent_budget_s:.1f}s "
+                f"contact_delta={self.force_descent_contact_fz_delta_n:.1f}N "
+                f"max_fz={self.force_descent_max_fz_n:.1f}N "
+                f"search_vz={self.force_descent_search_vz_mps * 1000:.1f}mm/s "
+                f"insert_vz={self.force_descent_insert_vz_mps * 1000:.1f}mm/s "
+                f"perturb_r={self.force_descent_perturb_radius_m * 1000:.1f}mm "
+                f"complete_depth={self.force_descent_complete_depth_m * 1000:.1f}mm "
+                f"vs_conf_gate={self.force_descent_require_vs_conf}/"
+                f"{self.force_descent_vs_conf_min:.2f}/{self.force_descent_vs_conf_ticks}t"
             )
 
         # Training-only DAgger collection mode. When enabled under
@@ -714,6 +864,13 @@ class RunACT(Policy):
             signs = np.array([-1.0, 0.0, 1.0], dtype=np.float64)[classes]
             self._last_visual_servo_direction_classes = classes.astype(int)
             self._last_visual_servo_direction_probs = probs
+            # Confidence = min over axes of the chosen-class probability. We
+            # require BOTH axes to be confidently classified before issuing a
+            # correction so that one ambiguous axis can't drag the gripper
+            # sideways while the other one is decisive.
+            self._last_visual_servo_direction_confidence = float(
+                np.min(np.max(probs, axis=1))
+            )
             pred_si = np.array(
                 [
                     signs[0] * self.visual_servo_direction_speed_mps,
@@ -998,6 +1155,25 @@ class RunACT(Policy):
         final_search_started_at = None
         final_search_anchor_pose = None
         insert_policy_active = False
+        # Force-descent state machine (T1.2 v2).
+        # WAITING → ARMED → LIFT → NAVIGATE → DESCEND → INSERT → COMPLETE
+        # ARMED:   wait for vs_conf streak, calibrate baseline F, snapshot anchor
+        # LIFT:    short upward push to clear surface contact (target reset on entry)
+        # NAVIGATE: walk in classifier-indicated xy direction until signs flip
+        # DESCEND: z down slowly, listen for first contact (force delta)
+        # INSERT:  contact detected — keep z descent until depth target
+        # COMPLETE: target depth reached, hold pose
+        # YIELDED: budget exhausted; hand back to Plan D unchanged.
+        force_descent_state = "WAITING"
+        force_descent_armed_at = None
+        force_descent_lift_started_at = None
+        force_descent_navigate_started_at = None
+        force_descent_descend_started_at = None
+        force_descent_anchor_pose_z = None  # tcp z at contact (set on INSERT entry)
+        force_descent_baseline_fz_samples = []
+        force_descent_baseline_fz = None
+        force_descent_vs_conf_streak = 0
+        force_descent_zero_signs_streak = 0  # ticks of classifier signs == (0,0)
 
         while (self.time_now() - trial_start).nanoseconds * 1e-9 < self.max_trial_s:
             loop_start = self.time_now()
@@ -1157,85 +1333,366 @@ class RunACT(Policy):
                         if xy_step_norm > self.visual_servo_max_xy_speed_mps:
                             xy_step *= self.visual_servo_max_xy_speed_mps / xy_step_norm
 
-                        action_used = action[:6].copy()
-                        action_used[0] = xy_step[0]
-                        action_used[1] = xy_step[1]
-                        if self.visual_servo_target_mode == "action_linear":
-                            pred_z = float(visual_servo_output_si[2] * self.visual_servo_gain)
-                            pred_z = float(
-                                np.clip(
-                                    pred_z,
-                                    -self.visual_servo_max_z_speed_mps,
-                                    self.visual_servo_max_z_speed_mps,
+                        # Confidence is only meaningful for xy_direction (3-way
+                        # softmax per axis). Continuous heads (delta, pixel_delta,
+                        # action_linear) get None and bypass the threshold unless
+                        # the user sets a positive min — then they hard-gate off.
+                        servo_conf = self._last_visual_servo_direction_confidence
+                        if self.visual_servo_assist_mode:
+                            gate_pass = True
+                            if self.visual_servo_confidence_min > 0.0:
+                                if (
+                                    servo_conf is None
+                                    or servo_conf < self.visual_servo_confidence_min
+                                ):
+                                    gate_pass = False
+                            if not gate_pass:
+                                # Hand back to upstream (ACT / insert policy)
+                                # untouched. action_used already holds it.
+                                conf_str = (
+                                    f"{servo_conf:.2f}"
+                                    if servo_conf is not None
+                                    else "na"
                                 )
-                            )
+                                visual_servo_debug = (
+                                    " vs_assist=gated"
+                                    f" vs_conf={conf_str}"
+                                    f" vs_min={self.visual_servo_confidence_min:.2f}"
+                                )
+                                mode_label = "VS_GATED"
+                            else:
+                                upstream_xy = action_used[:2].copy()
+                                combined_xy = upstream_xy + xy_step
+                                combined_norm = float(np.linalg.norm(combined_xy))
+                                if combined_norm > self.visual_servo_max_xy_speed_mps:
+                                    combined_xy *= (
+                                        self.visual_servo_max_xy_speed_mps
+                                        / combined_norm
+                                    )
+                                action_used[0] = combined_xy[0]
+                                action_used[1] = combined_xy[1]
+                                # Z stays at upstream value (act or insert).
+                                conf_str = (
+                                    f"{servo_conf:.2f}"
+                                    if servo_conf is not None
+                                    else "na"
+                                )
+                                visual_servo_debug = (
+                                    " vs_assist=on"
+                                    f" vs_conf={conf_str}"
+                                    f" vs_xy_add_mmps={np.round(xy_step * 1000.0, 1).tolist()}"
+                                    f" up_xy_mmps={np.round(upstream_xy * 1000.0, 1).tolist()}"
+                                    f" cmb_xy_mmps={np.round(combined_xy * 1000.0, 1).tolist()}"
+                                )
+                                mode_label = "VS_ASSIST"
                         else:
-                            pred_z = self.visual_servo_down_vz_mps
-                        if self.visual_servo_z_mode == "hold":
-                            action_used[2] = 0.0
-                        elif self.visual_servo_z_mode == "down":
-                            action_used[2] = self.visual_servo_down_vz_mps
-                        elif self.visual_servo_z_mode == "gate_down":
-                            action_used[2] = (
-                                self.visual_servo_down_vz_mps
-                                if xy_error_norm <= self.visual_servo_descend_xy_gate_m
-                                else 0.0
-                            )
-                        elif self.visual_servo_z_mode == "gate_act_down":
-                            if xy_error_norm <= self.visual_servo_descend_xy_gate_m:
+                            action_used = action[:6].copy()
+                            action_used[0] = xy_step[0]
+                            action_used[1] = xy_step[1]
+                            if self.visual_servo_target_mode == "action_linear":
+                                pred_z = float(
+                                    visual_servo_output_si[2] * self.visual_servo_gain
+                                )
+                                pred_z = float(
+                                    np.clip(
+                                        pred_z,
+                                        -self.visual_servo_max_z_speed_mps,
+                                        self.visual_servo_max_z_speed_mps,
+                                    )
+                                )
+                            else:
+                                pred_z = self.visual_servo_down_vz_mps
+                            if self.visual_servo_z_mode == "hold":
+                                action_used[2] = 0.0
+                            elif self.visual_servo_z_mode == "down":
                                 action_used[2] = self.visual_servo_down_vz_mps
-                        elif self.visual_servo_z_mode == "pred":
-                            action_used[2] = pred_z
-                        elif self.visual_servo_z_mode == "gate_pred":
-                            if xy_error_norm <= self.visual_servo_descend_xy_gate_m:
+                            elif self.visual_servo_z_mode == "gate_down":
+                                action_used[2] = (
+                                    self.visual_servo_down_vz_mps
+                                    if xy_error_norm <= self.visual_servo_descend_xy_gate_m
+                                    else 0.0
+                                )
+                            elif self.visual_servo_z_mode == "gate_act_down":
+                                if xy_error_norm <= self.visual_servo_descend_xy_gate_m:
+                                    action_used[2] = self.visual_servo_down_vz_mps
+                            elif self.visual_servo_z_mode == "pred":
                                 action_used[2] = pred_z
-                        if self.visual_servo_target_mode == "xy_direction":
-                            classes = self._last_visual_servo_direction_classes
-                            probs = self._last_visual_servo_direction_probs
-                            max_probs = (
-                                np.max(probs, axis=1).round(2).tolist()
-                                if probs is not None
-                                else []
-                            )
-                            visual_servo_debug = (
-                                " vs_dir_cls="
-                                f"{classes.tolist() if classes is not None else []}"
-                                " vs_dir_p="
-                                f"{max_probs}"
-                                " vs_xy_used_mmps="
-                                f"{np.round(xy_step * 1000.0, 1).tolist()}"
-                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm/s"
-                            )
-                        elif self.visual_servo_target_mode == "pixel_delta":
-                            xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
-                            visual_servo_debug = (
-                                " vs_px_delta="
-                                f"{np.round(self._last_visual_servo_pixel_delta_px, 1).tolist()}"
-                                " vs_xy_used_mm="
-                                f"{np.round(xy_error * 1000.0, 1).tolist()}"
-                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
-                            )
-                        elif self.visual_servo_target_mode == "action_linear":
-                            visual_servo_debug = (
-                                " vs_action_mmps="
-                                f"{np.round(visual_servo_output_si[:3] * 1000.0, 1).tolist()}"
-                                " vs_xy_used_mmps="
-                                f"{np.round(xy_step * 1000.0, 1).tolist()}"
-                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm/s"
-                            )
+                            elif self.visual_servo_z_mode == "gate_pred":
+                                if xy_error_norm <= self.visual_servo_descend_xy_gate_m:
+                                    action_used[2] = pred_z
+                            mode_label = "VISUAL_SERVO"
+                        # Legacy-replace debug strings only — assist mode already
+                        # wrote its own debug payload and mode_label above.
+                        if not self.visual_servo_assist_mode:
+                            if self.visual_servo_target_mode == "xy_direction":
+                                classes = self._last_visual_servo_direction_classes
+                                probs = self._last_visual_servo_direction_probs
+                                max_probs = (
+                                    np.max(probs, axis=1).round(2).tolist()
+                                    if probs is not None
+                                    else []
+                                )
+                                visual_servo_debug = (
+                                    " vs_dir_cls="
+                                    f"{classes.tolist() if classes is not None else []}"
+                                    " vs_dir_p="
+                                    f"{max_probs}"
+                                    " vs_xy_used_mmps="
+                                    f"{np.round(xy_step * 1000.0, 1).tolist()}"
+                                    f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm/s"
+                                )
+                            elif self.visual_servo_target_mode == "pixel_delta":
+                                xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                                visual_servo_debug = (
+                                    " vs_px_delta="
+                                    f"{np.round(self._last_visual_servo_pixel_delta_px, 1).tolist()}"
+                                    " vs_xy_used_mm="
+                                    f"{np.round(xy_error * 1000.0, 1).tolist()}"
+                                    f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
+                                )
+                            elif self.visual_servo_target_mode == "action_linear":
+                                visual_servo_debug = (
+                                    " vs_action_mmps="
+                                    f"{np.round(visual_servo_output_si[:3] * 1000.0, 1).tolist()}"
+                                    " vs_xy_used_mmps="
+                                    f"{np.round(xy_step * 1000.0, 1).tolist()}"
+                                    f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm/s"
+                                )
+                            else:
+                                xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                                visual_servo_debug = (
+                                    " vs_pred_mm="
+                                    f"{np.round(visual_servo_output_si[:3] * 1000.0, 1).tolist()}"
+                                    " vs_xy_used_mm="
+                                    f"{np.round(xy_error * 1000.0, 1).tolist()}"
+                                    f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
+                                )
+
+                # T1.2 Force-feedback final-descent state machine. Sequenced
+                # AFTER visual-servo assist so xy alignment has had time to
+                # settle, but BEFORE final_search so it can take priority when
+                # both are enabled.
+                if (
+                    mode_label != "BACKOFF"
+                    and self.force_descent_enabled
+                    and trial_elapsed_s >= self.force_descent_start_s
+                ):
+                    if force_descent_armed_at is None:
+                        force_descent_armed_at = sim_now
+                        force_descent_state = "ARMED"
+                        force_descent_baseline_fz_samples = []
+                        force_descent_vs_conf_streak = 0
+                        self.get_logger().warn(
+                            f"FORCE_DESCENT armed at t={trial_elapsed_s:.2f}s"
+                        )
+                    elapsed_fd_s = (sim_now - force_descent_armed_at).nanoseconds * 1e-9
+
+                    if elapsed_fd_s > self.force_descent_budget_s and force_descent_state not in {
+                        "COMPLETE",
+                        "YIELDED",
+                    }:
+                        self.get_logger().warn(
+                            f"FORCE_DESCENT yielded after {elapsed_fd_s:.1f}s "
+                            f"in state={force_descent_state}; handing back to upstream"
+                        )
+                        force_descent_state = "YIELDED"
+
+                    if force_descent_state == "ARMED":
+                        # Calibrate baseline force magnitude while VS confidence
+                        # streak builds. Hold position (zero linear vel; keep
+                        # ACT's rotational corrections to avoid drifting away
+                        # from a good observed pose).
+                        force_descent_baseline_fz_samples.append(force_mag)
+                        conf = self._last_visual_servo_direction_confidence
+                        conf_ok = (not self.force_descent_require_vs_conf) or (
+                            conf is not None and conf >= self.force_descent_vs_conf_min
+                        )
+                        if conf_ok:
+                            force_descent_vs_conf_streak += 1
                         else:
-                            xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
-                            visual_servo_debug = (
-                                " vs_pred_mm="
-                                f"{np.round(visual_servo_output_si[:3] * 1000.0, 1).tolist()}"
-                                " vs_xy_used_mm="
-                                f"{np.round(xy_error * 1000.0, 1).tolist()}"
-                                f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
+                            force_descent_vs_conf_streak = 0
+
+                        action_used = action[:6].copy()
+                        action_used[0] = 0.0
+                        action_used[1] = 0.0
+                        action_used[2] = 0.0
+
+                        ready = (
+                            len(force_descent_baseline_fz_samples) >= 10
+                            and force_descent_vs_conf_streak
+                            >= self.force_descent_vs_conf_ticks
+                        )
+                        if ready:
+                            force_descent_baseline_fz = float(
+                                np.median(force_descent_baseline_fz_samples)
                             )
-                        mode_label = "VISUAL_SERVO"
+                            # CRITICAL: reset the controller's target pose to
+                            # current TCP so Plan D's accumulated impedance
+                            # offset (up to 20mm of "stuck against board")
+                            # doesn't keep dragging the gripper down.
+                            tcp_pose = observation_msg.controller_state.tcp_pose
+                            last_target_pose = tcp_pose
+                            force_descent_lift_started_at = sim_now
+                            force_descent_state = "LIFT"
+                            self.get_logger().warn(
+                                "FORCE_DESCENT LIFT start "
+                                f"fmag_base={force_descent_baseline_fz:.2f}N "
+                                f"tcp=({tcp_pose.position.x:.4f},"
+                                f"{tcp_pose.position.y:.4f},"
+                                f"{tcp_pose.position.z:.4f}) — "
+                                "target reset to TCP"
+                            )
+                        mode_label = "FD_ARMED"
+
+                    elif force_descent_state == "LIFT":
+                        # Pure upward velocity for lift_duration_s to clear
+                        # contact with the board surface.
+                        action_used = action[:6].copy()
+                        action_used[0] = 0.0
+                        action_used[1] = 0.0
+                        action_used[2] = self.force_descent_lift_vz_mps
+                        t_lift = (
+                            sim_now - force_descent_lift_started_at
+                        ).nanoseconds * 1e-9
+                        if t_lift >= self.force_descent_lift_duration_s:
+                            force_descent_navigate_started_at = sim_now
+                            force_descent_state = "NAVIGATE"
+                            self.get_logger().warn(
+                                "FORCE_DESCENT NAVIGATE start "
+                                f"after lift t={t_lift:.2f}s fmag={force_mag:.2f}N"
+                            )
+                        mode_label = "FD_LIFT"
+
+                    elif force_descent_state == "NAVIGATE":
+                        # Walk in the direction the xy_direction classifier
+                        # currently reports. Use the LATEST classifier signs
+                        # each tick — the network has a fresh image and can
+                        # re-localize as the gripper moves. Z is held to keep
+                        # the gripper above the board during navigation.
+                        classes = self._last_visual_servo_direction_classes
+                        if classes is not None and len(classes) >= 2:
+                            sx = float([-1.0, 0.0, 1.0][int(classes[0])])
+                            sy = float([-1.0, 0.0, 1.0][int(classes[1])])
+                        else:
+                            sx = 0.0
+                            sy = 0.0
+                        dir_vec = np.array([sx, sy], dtype=np.float64)
+                        dir_norm = float(np.linalg.norm(dir_vec))
+                        if dir_norm < 1e-6:
+                            force_descent_zero_signs_streak += 1
+                            xy_cmd = np.zeros(2, dtype=np.float64)
+                        else:
+                            force_descent_zero_signs_streak = 0
+                            xy_cmd = (
+                                dir_vec / dir_norm
+                            ) * self.force_descent_navigate_speed_mps
+                            # Apply X/Y sign convention from env.
+                            xy_cmd *= self.visual_servo_xy_sign
+
+                        action_used = action[:6].copy()
+                        action_used[0] = xy_cmd[0]
+                        action_used[1] = xy_cmd[1]
+                        action_used[2] = 0.0  # hold z during navigation
+
+                        t_nav = (
+                            sim_now - force_descent_navigate_started_at
+                        ).nanoseconds * 1e-9
+                        port_found = (
+                            force_descent_zero_signs_streak
+                            >= self.force_descent_navigate_hold_ticks
+                        )
+                        if port_found or t_nav >= self.force_descent_navigate_max_s:
+                            force_descent_descend_started_at = sim_now
+                            force_descent_state = "DESCEND"
+                            self.get_logger().warn(
+                                "FORCE_DESCENT DESCEND start "
+                                f"t_nav={t_nav:.2f}s "
+                                f"port_found={port_found} "
+                                f"zero_streak={force_descent_zero_signs_streak}"
+                            )
+                        mode_label = "FD_NAVIGATE"
+
+                    elif force_descent_state == "DESCEND":
+                        # Slow downward push, listening for force-mag delta.
+                        # XY held; xy correction from VS_ASSIST already applied
+                        # to action upstream — but we want pure z descent here
+                        # to keep the contact event clean.
+                        action_used = action[:6].copy()
+                        action_used[0] = 0.0
+                        action_used[1] = 0.0
+                        action_used[2] = self.force_descent_search_vz_mps
+
+                        fmag_delta = force_mag - force_descent_baseline_fz
+                        t_descend = (
+                            sim_now - force_descent_descend_started_at
+                        ).nanoseconds * 1e-9
+                        if fmag_delta > self.force_descent_contact_fz_delta_n:
+                            tcp_pose = observation_msg.controller_state.tcp_pose
+                            force_descent_anchor_pose_z = tcp_pose.position.z
+                            force_descent_state = "INSERT"
+                            self.get_logger().warn(
+                                f"FORCE_DESCENT CONTACT t_descend={t_descend:.2f}s "
+                                f"fmag={force_mag:.2f}N delta={fmag_delta:.2f}N "
+                                f"z={force_descent_anchor_pose_z:.4f}"
+                            )
+                        elif force_mag > self.force_descent_max_fz_n:
+                            self.get_logger().warn(
+                                f"FORCE_DESCENT abort DESCEND: fmag={force_mag:.1f}N "
+                                f"exceeds max={self.force_descent_max_fz_n:.1f}N"
+                            )
+                            force_descent_state = "YIELDED"
+                        elif t_descend >= self.force_descent_descend_max_s:
+                            self.get_logger().warn(
+                                f"FORCE_DESCENT DESCEND timeout t={t_descend:.2f}s "
+                                f"no contact (fmag_delta={fmag_delta:.2f}N)"
+                            )
+                            force_descent_state = "YIELDED"
+                        mode_label = "FD_DESCEND"
+
+                    elif force_descent_state == "INSERT":
+                        # Freeze xy, push down. COMPLETE when depth target hit
+                        # OR if force spikes (chamfer didn't catch, abort).
+                        action_used = action[:6].copy()
+                        action_used[0] = 0.0
+                        action_used[1] = 0.0
+                        action_used[2] = self.force_descent_insert_vz_mps
+
+                        curr_z = observation_msg.controller_state.tcp_pose.position.z
+                        depth_m = abs(force_descent_anchor_pose_z - curr_z)
+
+                        if depth_m >= self.force_descent_complete_depth_m:
+                            force_descent_state = "COMPLETE"
+                            self.get_logger().warn(
+                                f"FORCE_DESCENT COMPLETE depth={depth_m * 1000:.1f}mm "
+                                f"fmag={force_mag:.2f}N"
+                            )
+                        elif force_mag > self.force_descent_max_fz_n:
+                            self.get_logger().warn(
+                                f"FORCE_DESCENT abort INSERT: fmag={force_mag:.1f}N "
+                                f"depth={depth_m * 1000:.1f}mm"
+                            )
+                            force_descent_state = "YIELDED"
+                        mode_label = "FD_INSERT"
+
+                    elif force_descent_state == "COMPLETE":
+                        # Stay put. Insertion declared complete.
+                        action_used = np.zeros(6, dtype=np.float64)
+                        mode_label = "FD_COMPLETE"
+                        # End the trial early so the engine credits us with
+                        # a shorter task duration. The duration sub-score is
+                        # linear in elapsed time, ~+2.7 pts per trial if we
+                        # cut from 30s to ~18s.
+                        if not self.force_descent_early_return_disabled:
+                            self.get_logger().warn(
+                                "FORCE_DESCENT COMPLETE — returning early "
+                                f"at t={trial_elapsed_s:.1f}s to claim duration bonus"
+                            )
+                            return True
+                    # YIELDED: fall through. action_used stays at upstream value.
 
                 if (
                     mode_label != "BACKOFF"
+                    and not mode_label.startswith("FD_")
                     and self.final_search_enabled
                     and trial_elapsed_s >= self.final_search_start_s
                 ):
@@ -1297,7 +1754,56 @@ class RunACT(Policy):
                         orientation=clamped_target.orientation,
                     )
                 last_target_pose = clamped_target
-                self.set_pose_target(move_robot=move_robot, pose=clamped_target)
+                vs_z_stiff_override = self.visual_servo_z_stiffness > 0.0
+                if mode_label in ("FD_DESCEND", "FD_INSERT"):
+                    # Boost z stiffness so the controller can actually push the
+                    # plug down — Plan D's default 1.8 N max isn't enough.
+                    self.set_pose_target(
+                        move_robot=move_robot,
+                        pose=clamped_target,
+                        stiffness=[
+                            90.0,
+                            90.0,
+                            self.force_descent_z_stiffness,
+                            50.0,
+                            50.0,
+                            50.0,
+                        ],
+                        damping=[
+                            50.0,
+                            50.0,
+                            self.force_descent_z_damping,
+                            20.0,
+                            20.0,
+                            20.0,
+                        ],
+                    )
+                elif vs_z_stiff_override and mode_label in ("VISUAL_SERVO", "VS_ASSIST"):
+                    # Optional: also boost z stiffness during Plan E REPLACE
+                    # mode or VS_ASSIST, so the visual servo can actually push
+                    # the gripper down toward the port height.
+                    self.set_pose_target(
+                        move_robot=move_robot,
+                        pose=clamped_target,
+                        stiffness=[
+                            90.0,
+                            90.0,
+                            self.visual_servo_z_stiffness,
+                            50.0,
+                            50.0,
+                            50.0,
+                        ],
+                        damping=[
+                            50.0,
+                            50.0,
+                            self.visual_servo_z_damping,
+                            20.0,
+                            20.0,
+                            20.0,
+                        ],
+                    )
+                else:
+                    self.set_pose_target(move_robot=move_robot, pose=clamped_target)
 
                 tcp = observation_msg.controller_state.tcp_pose.position
                 tgt = clamped_target.position

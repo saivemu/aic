@@ -1,0 +1,25 @@
+=== planE_fast :: 2026-05-14T02:01:47-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_planE_fast.env
+# Plan E REPLACE mode with faster classifier-direction step.
+# Default in trained model: 6mm/s; experiment log used 3mm/s.
+# Try 8mm/s to close the 5cm gap faster.
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=0
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.008
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.012
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+---
+>>> planE_fast run 1/3 starting at 2026-05-14T02:01:47-07:00
+  run 1: score=106.633 (exit=0)
+>>> planE_fast run 2/3 starting at 2026-05-14T02:03:59-07:00
+  run 2: score=125.527 (exit=0)
+>>> planE_fast run 3/3 starting at 2026-05-14T02:06:11-07:00
+  run 3: score=123.319 (exit=0)
+---
+all_scores: 106.633 125.527 123.319
+min=106.633 mean=118.493 max=125.527 n=3
+=== planE_fast done :: 2026-05-14T02:08:20-07:00 ===

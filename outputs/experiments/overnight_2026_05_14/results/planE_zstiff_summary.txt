@@ -1,0 +1,26 @@
+=== planE_zstiff :: 2026-05-14T02:23:37-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_planE_zstiff.env
+# Plan E REPLACE + z-stiffness boost during VISUAL_SERVO mode.
+# Lets Plan E's visual servo push the gripper down harder toward port height.
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=0
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.006
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+AIC_VISUAL_SERVO_Z_STIFFNESS=500.0
+AIC_VISUAL_SERVO_Z_DAMPING=100.0
+---
+>>> planE_zstiff run 1/3 starting at 2026-05-14T02:23:37-07:00
+  run 1: score=122.927 (exit=0)
+>>> planE_zstiff run 2/3 starting at 2026-05-14T02:25:44-07:00
+  run 2: score=122.902 (exit=0)
+>>> planE_zstiff run 3/3 starting at 2026-05-14T02:27:50-07:00
+  run 3: score=123.101 (exit=0)
+---
+all_scores: 122.927 122.902 123.101
+min=122.902 mean=122.977 max=123.101 n=3
+=== planE_zstiff done :: 2026-05-14T02:29:57-07:00 ===

@@ -3,3 +3,6 @@ services:
   eval:
     volumes:
       - ${HOME}/aic_results:/root/aic_results
+  model:
+    volumes:
+      - ../outputs/plan_insert/pretrained_model:/opt/policy_insert:ro

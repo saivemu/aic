@@ -1,0 +1,24 @@
+=== winner_gain15 :: 2026-05-14T03:44:57-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_winner_gain15.env
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=1
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_GAIN=1.5
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.012
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+AIC_VISUAL_SERVO_Z_STIFFNESS=500.0
+AIC_VISUAL_SERVO_Z_DAMPING=100.0
+---
+>>> winner_gain15 run 1/3 starting at 2026-05-14T03:44:57-07:00
+  run 1: score=126.685 (exit=0)
+>>> winner_gain15 run 2/3 starting at 2026-05-14T03:47:04-07:00
+  run 2: score=126.754 (exit=0)
+>>> winner_gain15 run 3/3 starting at 2026-05-14T03:49:12-07:00
+  run 3: score=127.184 (exit=0)
+---
+all_scores: 126.685 126.754 127.184
+min=126.685 mean=126.874 max=127.184 n=3
+=== winner_gain15 done :: 2026-05-14T03:51:20-07:00 ===

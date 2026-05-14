@@ -1,0 +1,23 @@
+=== assist_pixel :: 2026-05-14T02:38:11-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_assist_pixel.env
+# ASSIST mode using the pixel_delta head — adds continuous xy correction to Plan D.
+# Bypass confidence gate (pixel_delta is continuous, no per-axis classifier conf).
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=1
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.006
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+---
+>>> assist_pixel run 1/3 starting at 2026-05-14T02:38:11-07:00
+  run 1: score=125.308 (exit=0)
+>>> assist_pixel run 2/3 starting at 2026-05-14T02:40:22-07:00
+  run 2: score=126.301 (exit=0)
+>>> assist_pixel run 3/3 starting at 2026-05-14T02:42:35-07:00
+  run 3: score=126.017 (exit=0)
+---
+all_scores: 125.308 126.301 126.017
+min=125.308 mean=125.875 max=126.301 n=3
+=== assist_pixel done :: 2026-05-14T02:44:45-07:00 ===

@@ -1,0 +1,26 @@
+=== assist_pixel_zstiff :: 2026-05-14T02:58:59-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_assist_pixel_zstiff.env
+# ASSIST + pixel_delta + 10mm/s + z-stiffness boost during VS_ASSIST.
+# Best xy correction config + harder z descent to push gripper closer to port.
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=1
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.010
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+
+AIC_VISUAL_SERVO_Z_STIFFNESS=500.0
+AIC_VISUAL_SERVO_Z_DAMPING=100.0
+---
+>>> assist_pixel_zstiff run 1/3 starting at 2026-05-14T02:58:59-07:00
+  run 1: score=128.590 (exit=0)
+>>> assist_pixel_zstiff run 2/3 starting at 2026-05-14T03:01:03-07:00
+  run 2: score=128.682 (exit=0)
+>>> assist_pixel_zstiff run 3/3 starting at 2026-05-14T03:03:13-07:00
+  run 3: score=127.754 (exit=0)
+---
+all_scores: 128.590 128.682 127.754
+min=127.754 mean=128.342 max=128.682 n=3
+=== assist_pixel_zstiff done :: 2026-05-14T03:05:19-07:00 ===

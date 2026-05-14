@@ -1,0 +1,24 @@
+=== assist_pixel_fast :: 2026-05-14T02:45:22-07:00 ===
+Env vars file: outputs/experiments/overnight_2026_05_14/env_assist_pixel_fast.env
+# ASSIST mode + pixel_delta head + faster xy speed cap.
+# Tries to capture some of the partial-insertion upside of REPLACE mode while
+# keeping ASSIST's stability (Plan D xy as fallback when classifier wobbles).
+AIC_POLICY_PLAN=d
+AIC_VISUAL_SERVO_START_S=9.0
+AIC_VISUAL_SERVO_Z_MODE=act
+AIC_VISUAL_SERVO_ASSIST_MODE=1
+AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.010
+AIC_MAX_TRIAL_S=30.0
+AIC_FORCE_DESCENT_ENABLED=0
+---
+>>> assist_pixel_fast run 1/3 starting at 2026-05-14T02:45:22-07:00
+  run 1: score=126.569 (exit=0)
+>>> assist_pixel_fast run 2/3 starting at 2026-05-14T02:47:28-07:00
+  run 2: score=126.570 (exit=0)
+>>> assist_pixel_fast run 3/3 starting at 2026-05-14T02:49:37-07:00
+  run 3: score=127.039 (exit=0)
+---
+all_scores: 126.569 126.570 127.039
+min=126.569 mean=126.726 max=127.039 n=3
+=== assist_pixel_fast done :: 2026-05-14T02:51:47-07:00 ===

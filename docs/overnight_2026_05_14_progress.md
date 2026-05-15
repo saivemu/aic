@@ -300,3 +300,33 @@ Keep the docs and experiment artifacts even if reverting the code — the env
 files document the search space, and the logs prove that force-descent +
 stiffness override actually CAN move the gripper (the missing piece is just
 knowing where to aim it).
+
+## 2026-05-14 evening addendum: Plan G preflight
+
+Trained a Diffusion Policy (`outputs/train/diffusion_plan_g_v1`) on the same
+`aic_act_v2` data Plan D used. Hyperparams: horizon 16, n_action_steps 8,
+n_obs_steps 2, resnet18 backbone, DDPM, 100 train timesteps, batch 4, 40k
+steps. Final loss ~0.001.
+
+**Disqualified at preflight on latency:**
+
+| | Plan D ACT | Plan G Diffusion |
+|---|---:|---:|
+| inference per tick | 1.4 ms | 81.4 ms |
+| 50 ms control budget @ 20 Hz | ✅ | ❌ (62% over) |
+
+The diffusion model's `num_inference_steps=None` defaults to 100 denoising
+steps per inference call. Running 8 ticks of `select_action` (the chunk
+replay interval) takes 651 ms wallclock — but the 8 ticks should be
+consumed in 400 ms. The control loop would drop ~6 ticks per inference,
+silently degrading ASSIST mode and likely reproducing Plan C's −27 pt
+regression. Synthetic input also produced 620+ mm/s linear velocity
+commands (vs typical ~10 mm/s) — possibly a normalization-on-random-input
+artifact, but combined with the latency failure, not worth investigating
+further.
+
+**Decision**: skip Plan G-full (Diffusion + new pixel_delta). Focus Plan G
+on G-lite (Plan D ACT + new pixel_delta head trained on
+`vision_servo_longrange40_o80`). Diffusion runtime would need
+`num_inference_steps≤10` (DDIM) or a 2x faster backbone to fit the
+control loop budget — defer to Plan H or later.

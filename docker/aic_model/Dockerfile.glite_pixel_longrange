@@ -1,0 +1,50 @@
+# Plan G-lite: same runtime as F-safe (assist_pixel_zstiff) but with the
+# pixel_delta head retrained on the wider-offset dataset (vision_servo_longrange40_o80,
+# 15,672 frames, p50 xy=33 mm vs old p50=4.3 mm). Isolates the perception variable.
+# Diffusion is NOT used here (latency 81 ms > 50 ms control budget — disqualified).
+#
+# Build:
+#   docker build -t aic-runact:glite-pixel-longrange-v1 -f docker/aic_model/Dockerfile.glite_pixel_longrange .
+#
+# Tag + push:
+#   docker tag aic-runact:glite-pixel-longrange-v1 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/bot-squad-l2-learning-loop:glite-pixel-longrange-v1
+#   docker push 973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/bot-squad-l2-learning-loop:glite-pixel-longrange-v1
+
+FROM aic-runact:plans-bc
+
+# NEW pixel_delta head trained on the long-range dataset (60 epochs, batch 64).
+COPY outputs/experiments/vision_servo_labels/models/visual_pixel_delta_longrange40_o80_e60 /opt/visual_servo
+
+COPY --chmod=755 <<"EOF" /entrypoint_glite_pixel_longrange.sh
+#!/bin/bash
+set -e
+# Identical to assist_pixel_zstiff entrypoint except for the head path.
+export AIC_POLICY_PLAN=d
+export AIC_VISUAL_SERVO_MODEL_PATH=/opt/visual_servo/best_visual_servo.pt
+export AIC_VISUAL_SERVO_START_S=9.0
+export AIC_VISUAL_SERVO_GAIN=0.75
+export AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.010
+export AIC_VISUAL_SERVO_MAX_Z_SPEED_MPS=0.020
+export AIC_VISUAL_SERVO_DOWN_VZ_MPS=-0.006
+export AIC_VISUAL_SERVO_Z_MODE=act
+export AIC_VISUAL_SERVO_DESCEND_XY_GATE_M=0.010
+export AIC_VISUAL_SERVO_MAX_ABS_ERR_M=0.050
+export AIC_VISUAL_SERVO_X_SIGN=1.0
+export AIC_VISUAL_SERVO_Y_SIGN=1.0
+export AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+export AIC_VISUAL_SERVO_ASSIST_MODE=1
+export AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+export AIC_VISUAL_SERVO_Z_STIFFNESS=500.0
+export AIC_VISUAL_SERVO_Z_DAMPING=100.0
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+echo "glite_pixel_longrange entrypoint: forced config baked into env"
+echo "  AIC_VISUAL_SERVO_MODEL_PATH=$AIC_VISUAL_SERVO_MODEL_PATH (longrange40_o80 head)"
+echo "  AIC_VISUAL_SERVO_ASSIST_MODE=$AIC_VISUAL_SERVO_ASSIST_MODE (1=ADD)"
+echo "  AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=$AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS"
+echo "  AIC_VISUAL_SERVO_Z_STIFFNESS=$AIC_VISUAL_SERVO_Z_STIFFNESS"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_glite_pixel_longrange.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

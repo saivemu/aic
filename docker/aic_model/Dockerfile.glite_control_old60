@@ -1,0 +1,41 @@
+# Plan G-lite control: same runtime as Plan G-lite but using the OLD dataset
+# retrained at 60 epochs (instead of the original 10 epochs). Isolates the
+# "longer training" confound from the "wider distribution" effect. If this
+# image scores like F-safe, the new dataset is the real cause of any G-lite
+# gain. If it matches G-lite, training budget was the actual lever.
+#
+# Build:
+#   docker build -t aic-runact:glite-control-old60-v1 -f docker/aic_model/Dockerfile.glite_control_old60 .
+
+FROM aic-runact:plans-bc
+
+COPY outputs/experiments/vision_servo_labels/models/visual_pixel_delta_balanced20_o25_s2_e60 /opt/visual_servo
+
+COPY --chmod=755 <<"EOF" /entrypoint_glite_control_old60.sh
+#!/bin/bash
+set -e
+export AIC_POLICY_PLAN=d
+export AIC_VISUAL_SERVO_MODEL_PATH=/opt/visual_servo/best_visual_servo.pt
+export AIC_VISUAL_SERVO_START_S=9.0
+export AIC_VISUAL_SERVO_GAIN=0.75
+export AIC_VISUAL_SERVO_MAX_XY_SPEED_MPS=0.010
+export AIC_VISUAL_SERVO_MAX_Z_SPEED_MPS=0.020
+export AIC_VISUAL_SERVO_DOWN_VZ_MPS=-0.006
+export AIC_VISUAL_SERVO_Z_MODE=act
+export AIC_VISUAL_SERVO_DESCEND_XY_GATE_M=0.010
+export AIC_VISUAL_SERVO_MAX_ABS_ERR_M=0.050
+export AIC_VISUAL_SERVO_X_SIGN=1.0
+export AIC_VISUAL_SERVO_Y_SIGN=1.0
+export AIC_VISUAL_SERVO_DIRECTION_SPEED_MPS=0.003
+export AIC_VISUAL_SERVO_ASSIST_MODE=1
+export AIC_VISUAL_SERVO_CONFIDENCE_MIN=0.0
+export AIC_VISUAL_SERVO_Z_STIFFNESS=500.0
+export AIC_VISUAL_SERVO_Z_DAMPING=100.0
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+echo "glite_control_old60 entrypoint: same runtime, OLD dataset 60ep head"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_glite_control_old60.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

@@ -3,6 +3,7 @@
 Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-14 (overnight round). If anything below disagrees with reality, fix this doc.
 
 **Companion docs you'll want open:**
+- 🔴 **[`resume_state_2026_05_14_evening.md`](resume_state_2026_05_14_evening.md)** — pinned resume context after the 2026-05-14 evening workstation move. Read this first if returning from a power-off.
 - [`overnight_2026_05_14_progress.md`](overnight_2026_05_14_progress.md) — the 2026-05-14 overnight log: 14 configs, ASSIST-mode breakthrough, both ECR images pushed.
 - [`cheatcode_hackathon_success_plan.md`](cheatcode_hackathon_success_plan.md) — original strategy doc (Phases A–F). Now superseded for C–F by `phase_cdef_replan.md`, but Phases A/B are still valid background.
 - [`cheatcode_dataset_collection.md`](cheatcode_dataset_collection.md) — the operational recipe for running the eval-stack + CheatCode + recorder pipeline. The how-to behind the dataset rows in the tracker below.

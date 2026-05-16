@@ -1,6 +1,6 @@
 # Project status — AIC cable insertion
 
-Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-15. If anything below disagrees with reality, fix this doc.
+Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-16. If anything below disagrees with reality, fix this doc.
 
 **Companion docs you'll want open:**
 - 🔴 **[`resume_state_2026_05_14_evening.md`](resume_state_2026_05_14_evening.md)** — pinned resume context after the 2026-05-14 evening workstation move. Read this first if returning from a power-off.
@@ -10,6 +10,9 @@ Single source of truth for what's been done, what's shipped, and what's still op
 - [`cheatcode_training_notes.md`](cheatcode_training_notes.md) — implementation details for the recorder + training side (recorder QoS, action synthesis, episode boundaries).
 - [`visual_servo_experiment_log.md`](visual_servo_experiment_log.md) — May-14 final-alignment experiments, scores, dead ends, and next steps.
 - [`final_approach_recovery_dataset_plan.md`](final_approach_recovery_dataset_plan.md) — current plan for a clean, guaranteed-insertion recovery dataset.
+- [`flow_matching_attempt_2026_05_15.md`](flow_matching_attempt_2026_05_15.md) — rectified-flow final-stage attempt; best was 143.20, below the ACT baseline.
+- [`pixel_insert_controller_attempt_2026_05_15.md`](pixel_insert_controller_attempt_2026_05_15.md) — pixel-gated final insertion controller attempt; best was 148.15, below the ACT baseline.
+- [`sc_routed_expert_attempt_2026_05_16.md`](sc_routed_expert_attempt_2026_05_16.md) — SC-only routed expert attempt; router worked, scores regressed.
 - See the full doc map at the bottom.
 
 ## Tracker at a glance
@@ -23,7 +26,9 @@ Single source of truth for what's been done, what's shipped, and what's still op
 | **E** | Plan D + optional final visual servo/search/insertion handoff | local TF-labeled visual-servo data | 43-D | 576×512 | **124.85 best local** ³ | experimental, not shipped |
 | **F-safe** | Plan D + pixel_delta VS in ASSIST mode + z-stiffness 500 N/m boost during VS | same as E | 43-D | 576×512 | **127.77 mean / 128.41 max (5-run)** ⁴ | **pushed to ECR 2026-05-14 as `assist-pixel-zstiff-v1`**, not yet submitted |
 | **F-aggressive** | Plan D + pixel_delta VS in REPLACE mode | same as E | 43-D | 576×512 | **124.5 mean / 139.02 max (3-run)** ⁵ | **pushed to ECR 2026-05-14 as `plane-pixel-v1`**, not yet submitted |
-| **Exact clean28** | ACT, 10k steps | exact no-perturb 30, bad trials 6/15 excluded | 43-D | 576×512 | **127.29 plain / 139.91 with F-safe assist** ⁶ | local only; current best local score but still not reliable full insertion |
+| **Exact clean28** | ACT, 10k steps | exact no-perturb 30, bad trials 6/15 excluded | 43-D | 576×512 | **127.29 plain / 139.91 with F-safe assist** ⁶ | local only; superseded by final recovery clean25 |
+| **Final recovery clean25** | ACT, 10k steps | final-recovery dataset, clean25 subset | 43-D | 576×512 | **148.90** | best current scored candidate; ECR tag `act-clean25-1489-v1` |
+| **SC routed expert** | Base ACT + SC-only routed ACT / final helper | 8 successful exact SC episodes | 43-D | 576×512 | **126.81 best** | rejected; exact-success SC expert does not transfer to policy drift states |
 
 ¹ Plan B as recorded May-5 from image `aic-runact:plan-b-v3`. Rebuilding the same source today gets 103.6 due to a cuDNN kernel-selection drift; this is the rebuild-variance floor we used to set Plan D's 115 ship gate.
 ² Plan D: min over 3 back-to-back compose runs is 123.06; variance 0.5 pts.
@@ -43,6 +48,7 @@ daily submission slot:
 | `plan-d-v1` (live submission) | 123.06 cluster | shipped | `…:plan-d-v1` (`sha256:0be3ba70a5acea742f3660a8a9822fbcddba3d0bae1e09f6cb46ce21339c0e72`) |
 | `assist-pixel-zstiff-v1` | 127.77 mean / 128.41 max (5-run, 1.16 pt spread) | **low — recommended** | `…:assist-pixel-zstiff-v1` (`sha256:db5fd50759d737718608f3d65ed6757741d335eaaeefe26af7b050daf42c41f4`) |
 | `plane-pixel-v1` | 124.5 mean / 139.02 max (3-run, 28 pt spread) | high — one trial hit partial insertion | `…:plane-pixel-v1` (`sha256:6cfdce784add64d55c886e8156e9ee7e496165086d0d09ed73d414385a764141`) |
+| `act-clean25-1489-v1` | 148.903 (single scoring run) | best scored candidate so far; still no trial-3 insertion | `…:act-clean25-1489-v1` (`sha256:2e98cf422fb57f70239f33c7b48e67d7efebfebfa352689b90b24d9cc2ce26d8`) |
 
 Full registry prefix: `973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/bot-squad-l2-learning-loop:` + the tag above.
 
@@ -86,6 +92,43 @@ did not solve insertion:
 The useful conclusion is that exact successful demonstrations are necessary but
 not sufficient. The next dataset needs clean final-approach recovery episodes,
 not just more ideal-path insertions.
+
+## May-16 routed SC expert attempt
+
+We tested the hypothesis that trial 3 should be handled by an SC-specialist
+policy instead of the shared SFP/SC ACT policy.
+
+Implemented support:
+
+- `AIC_SC_POLICY_PATH` in `RunACT.py` to route `plug_type=sc` tasks to a
+  separate ACT checkpoint.
+- `SC_POLICY_PATH` in `score_policy.sh` for local eval.
+- `Dockerfile.routed_sc_submission` for packaging a base policy plus an SC
+  expert.
+
+Training:
+
+- Fine-tuned from the best `148.903` ACT checkpoint.
+- Used successful exact SC episodes only: `[2, 8, 11, 17, 20, 23, 26, 29]`.
+- Output: `outputs/train/act_sc_exact_success8_from_clean25_v1`.
+
+Scores:
+
+| Candidate | Local score | Trial 3 | Result |
+|---|---:|---:|---|
+| Whole-trial SC router, 500-step expert | 126.00 | 38.87 | no insertion |
+| Whole-trial SC router, 3000-step expert | 126.81 | 39.75 | no insertion |
+| Base ACT + SC expert as final helper | 121.82 | 34.56 | no insertion, final distance regressed to 0.08 m |
+
+Conclusion: routing works mechanically, but the SC-only model trained on exact
+successful SC episodes is not useful under our policy rollout distribution. It
+learns the aggressive teacher approach, saturates the 20 mm target clamp early,
+and still does not create the final insertion event. As a final helper, its xy
+corrections are unreliable and push trial 3 farther off-port.
+
+This closes the "just use an SC specialist trained on successful exact SC"
+branch. The next SC attempt needs recovery data from the drifted states our
+policy actually reaches, or a direct port-localization/controller path.
 
 ## Datasets on disk / Hub
 
@@ -173,6 +216,11 @@ mean, 1.16 pt spread); `plane-pixel-v1` is the high-ceiling gamble (range
 - **Tightening the ASSIST-mode confidence threshold above ~0.5** for the xy_direction head. The classifier's per-axis confidence rarely clears 0.75; high thresholds gate out the assist 70% of the time, leaving Plan D's stuck-state to dominate. Either use pixel_delta (no per-axis confidence, just continuous output) or drop the gate.
 - **Visual-servo direction speed > ~6 mm/s in REPLACE mode** (planE_fast scored 118.5 mean with one 106 run). The head outputs occasional wrong directions; at fast speeds those errors compound into off-port drift.
 - **Extending `AIC_MAX_TRIAL_S` past 30 s.** The 2026-05-14 run with 45 s scored 112.56 — Tier-2 duration penalty grows linearly and eats whatever proximity improvement the extra time buys.
+- **SC routed expert trained only on exact successful SC episodes.** The
+  2026-05-16 attempt scored 126.81 best and did not improve trial 3. Exact
+  success episodes do not cover the drifted final states reached by the learned
+  policy, so the specialist just reproduces aggressive teacher approach motions
+  and still misses insertion.
 
 ## Pixi-env quirks worth knowing about
 
@@ -197,3 +245,6 @@ These will bite if anyone rebuilds the environment from scratch:
 | [`overnight_2026_05_14_progress.md`](overnight_2026_05_14_progress.md) | May-14 overnight log: 14 configs swept, ASSIST-mode pixel_delta + z-stiffness breakthrough (mean 127.77), both Plan F images pushed to ECR. |
 | [`perturbed_cheatcode_dataset_plan.md`](perturbed_cheatcode_dataset_plan.md) | Perturbation-data plan and 2026-05-15 smoke validation. |
 | [`final_approach_recovery_dataset_plan.md`](final_approach_recovery_dataset_plan.md) | Current plan for a clean, full-insertion final-recovery training dataset. |
+| [`flow_matching_attempt_2026_05_15.md`](flow_matching_attempt_2026_05_15.md) | Rectified-flow final-stage policy attempt on top of the ACT base; did not beat 148.903. |
+| [`pixel_insert_controller_attempt_2026_05_15.md`](pixel_insert_controller_attempt_2026_05_15.md) | Pixel-gated final insertion controller attempt; did not beat 148.903. |
+| [`sc_routed_expert_attempt_2026_05_16.md`](sc_routed_expert_attempt_2026_05_16.md) | SC routed expert experiment; router worked but the specialist regressed score. |

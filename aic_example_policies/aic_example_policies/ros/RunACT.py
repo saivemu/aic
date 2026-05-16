@@ -205,6 +205,7 @@ class RunACT(Policy):
         self.insert_action_std = None
         self.insert_action_min = None
         self.insert_action_max = None
+        self.flow_policy = None
 
         self.get_logger().info(
             f"{policy_type.upper()} Policy loaded on {self.device} from {policy_path} "
@@ -378,6 +379,58 @@ class RunACT(Policy):
                 f"down_vz={self.insert_policy_down_vz_mps * 1000:.1f}mm/s "
                 f"(state_norm={self._insert_state_norm_mode}, "
                 f"action_norm={self._insert_action_norm_mode})"
+            )
+
+        flow_policy_raw = os.environ.get("AIC_FLOW_POLICY_PATH", "").strip()
+        self.flow_policy_start_s = float(os.environ.get("AIC_FLOW_POLICY_START_S", "8.0"))
+        self.flow_policy_max_lin_speed_mps = float(
+            os.environ.get("AIC_FLOW_POLICY_MAX_LIN_SPEED_MPS", "0.020")
+        )
+        self.flow_policy_mode = os.environ.get("AIC_FLOW_POLICY_MODE", "full").lower()
+        if self.flow_policy_mode not in {"full", "xy_down"}:
+            raise ValueError(
+                "AIC_FLOW_POLICY_MODE must be 'full' or 'xy_down' "
+                f"(got {self.flow_policy_mode!r})"
+            )
+        self.flow_policy_xy_gain = float(os.environ.get("AIC_FLOW_POLICY_XY_GAIN", "1.0"))
+        self.flow_policy_max_xy_speed_mps = float(
+            os.environ.get(
+                "AIC_FLOW_POLICY_MAX_XY_SPEED_MPS",
+                str(self.flow_policy_max_lin_speed_mps),
+            )
+        )
+        self.flow_policy_down_vz_mps = float(
+            os.environ.get("AIC_FLOW_POLICY_DOWN_VZ_MPS", "-0.006")
+        )
+        if flow_policy_raw:
+            flow_policy_path = Path(flow_policy_raw)
+            if not flow_policy_path.exists():
+                raise FileNotFoundError(f"AIC_FLOW_POLICY_PATH does not exist: {flow_policy_path}")
+            flow_steps = os.environ.get("AIC_FLOW_POLICY_STEPS", "").strip()
+            flow_replan = os.environ.get("AIC_FLOW_POLICY_REPLAN_EVERY", "").strip()
+            from lerobot_robot_aic.flow_policy import FlowPolicyRunner
+
+            self.flow_policy = FlowPolicyRunner.load(
+                flow_policy_path,
+                self.device,
+                steps=int(flow_steps) if flow_steps else None,
+                replan_every=int(flow_replan) if flow_replan else None,
+            )
+            if self.flow_policy.cfg.state_dim != 26 + 6 + TASK_DIM:
+                raise ValueError(
+                    f"Flow policy state_dim={self.flow_policy.cfg.state_dim} "
+                    f"but RunACT builds 43-D Plan D state"
+                )
+            self.get_logger().warn(
+                f"Experimental rectified-flow policy loaded from {flow_policy_path}; "
+                f"start={self.flow_policy_start_s:.1f}s "
+                f"mode={self.flow_policy_mode} "
+                f"steps={self.flow_policy.steps} "
+                f"replan={self.flow_policy.replan_every} "
+                f"max_lin_speed={self.flow_policy_max_lin_speed_mps * 1000:.1f}mm/s "
+                f"max_xy_speed={self.flow_policy_max_xy_speed_mps * 1000:.1f}mm/s "
+                f"xy_gain={self.flow_policy_xy_gain:.2f} "
+                f"down_vz={self.flow_policy_down_vz_mps * 1000:.1f}mm/s"
             )
 
         # Per-trial task one-hot — populated in insert_cable() from the Task struct.
@@ -742,6 +795,26 @@ class RunACT(Policy):
         # Formula: (x - mean) / std
         return (tensor - mean) / std
 
+    def _flow_images_tensor(self, obs_msg: Observation) -> torch.Tensor:
+        """Build raw [camera, channel, height, width] float images for FlowPolicyRunner."""
+        images = []
+        for raw_img in (
+            obs_msg.left_image,
+            obs_msg.center_image,
+            obs_msg.right_image,
+        ):
+            img_np = np.frombuffer(raw_img.data, dtype=np.uint8).reshape(
+                raw_img.height,
+                raw_img.width,
+                3,
+            )
+            images.append(
+                torch.from_numpy(np.ascontiguousarray(img_np))
+                .permute(2, 0, 1)
+                .float()
+            )
+        return torch.stack(images, dim=0).to(self.device)
+
     def _build_visual_servo_model(self, state_dim: int, output_dim: int) -> torch.nn.Module:
         """Architecture mirror for train_visual_servo.py."""
         nn = torch.nn
@@ -787,7 +860,7 @@ class RunACT(Policy):
         return VisualServoNet()
 
     def _raw_plan_d_state(self, obs_msg: Observation) -> np.ndarray:
-        """Build the raw 43-D state used by the visual-servo regressor."""
+        """Build the raw 43-D state used by final-stage helper models."""
         tcp_pose = obs_msg.controller_state.tcp_pose
         tcp_vel = obs_msg.controller_state.tcp_velocity
         wrench = obs_msg.wrist_wrench.wrench
@@ -1089,11 +1162,17 @@ class RunACT(Policy):
         self.policy.reset()
         if self.insert_policy is not None:
             self.insert_policy.reset()
+        if self.flow_policy is not None:
+            self.flow_policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
 
         # Build the task identity one-hot exactly as record_dataset.py does for
         # training data. Stays at zeros for Plan B (state dim 26) checkpoints.
-        if self._state_includes_wrench_and_task or self.visual_servo_model is not None:
+        if (
+            self._state_includes_wrench_and_task
+            or self.visual_servo_model is not None
+            or self.flow_policy is not None
+        ):
             self.current_task_vec = encode_task(
                 task.target_module_name, task.port_name, task.plug_type
             )
@@ -1161,6 +1240,7 @@ class RunACT(Policy):
         final_search_started_at = None
         final_search_anchor_pose = None
         insert_policy_active = False
+        flow_policy_active = False
         # Force-descent state machine (T1.2 v2).
         # WAITING → ARMED → LIFT → NAVIGATE → DESCEND → INSERT → COMPLETE
         # ARMED:   wait for vs_conf streak, calibrate baseline F, snapshot anchor
@@ -1320,6 +1400,44 @@ class RunACT(Policy):
 
                 visual_servo_output_si = None
                 visual_servo_debug = ""
+                if (
+                    mode_label != "BACKOFF"
+                    and self.flow_policy is not None
+                    and trial_elapsed_s >= self.flow_policy_start_s
+                ):
+                    if not flow_policy_active:
+                        self.flow_policy.reset()
+                        flow_policy_active = True
+                        self.get_logger().warn(
+                            f"FLOW_POLICY start at t={trial_elapsed_s:.2f}s"
+                        )
+                    with torch.inference_mode():
+                        flow_action_tensor = self.flow_policy.select_action(
+                            self._flow_images_tensor(observation_msg),
+                            torch.from_numpy(self._raw_plan_d_state(observation_msg)).float(),
+                        )
+                    flow_action = flow_action_tensor.detach().cpu().numpy()[:6].copy()
+                    if np.all(np.isfinite(flow_action)):
+                        if self.flow_policy_mode == "xy_down":
+                            upstream_action = action_used.copy()
+                            xy_action = flow_action[:2] * self.flow_policy_xy_gain
+                            xy_norm = float(np.linalg.norm(xy_action))
+                            if xy_norm > self.flow_policy_max_xy_speed_mps:
+                                xy_action *= self.flow_policy_max_xy_speed_mps / xy_norm
+                            action_used = upstream_action
+                            action_used[0] = xy_action[0]
+                            action_used[1] = xy_action[1]
+                            action_used[2] = self.flow_policy_down_vz_mps
+                        else:
+                            action_used = flow_action
+                            lin_norm = float(np.linalg.norm(action_used[:3]))
+                            if lin_norm > self.flow_policy_max_lin_speed_mps:
+                                action_used[:3] *= self.flow_policy_max_lin_speed_mps / lin_norm
+                        mode_label = f"FLOW_{self.flow_policy_mode.upper()}"
+                    else:
+                        self.get_logger().warn(
+                            f"FLOW_POLICY produced non-finite action: {flow_action.tolist()}"
+                        )
                 if (
                     mode_label != "BACKOFF"
                     and self.visual_servo_model is not None

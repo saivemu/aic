@@ -60,6 +60,7 @@ log "config=$CONFIG"
 log "dataset_root=$DATASET_ROOT"
 log "results_dir=$RESULTS_DIR"
 log "train_output=$TRAIN_OUTPUT"
+log "sc_final_perturb_scale=${AIC_CHEATCODE_SC_FINAL_PERTURB_SCALE:-1.0}"
 
 {
   echo "RUN_NAME=$RUN_NAME"
@@ -69,6 +70,7 @@ log "train_output=$TRAIN_OUTPUT"
   echo "DATASET_ROOT=$DATASET_ROOT"
   echo "RESULTS_DIR=$RESULTS_DIR"
   echo "TRAIN_OUTPUT=$TRAIN_OUTPUT"
+  echo "AIC_CHEATCODE_SC_FINAL_PERTURB_SCALE=${AIC_CHEATCODE_SC_FINAL_PERTURB_SCALE:-1.0}"
 } >> "$STATUS_FILE"
 
 cleanup_bags_loop &
@@ -106,7 +108,7 @@ echo "RECORDER_PID=$RECORDER_PID" >> "$STATUS_FILE"
 
 sleep 3
 
-log "starting CheatCode model with mild midcourse perturbations"
+log "starting CheatCode model with perturb_mode=${AIC_CHEATCODE_PERTURB_MODE:-midcourse}"
 pixi run env \
   PYTHONPATH="$ROOT/aic_example_policies:$ROOT/.pixi/envs/default/lib/python/site-packages:$ROOT/.pixi/envs/default/lib/python3.12/site-packages" \
   RMW_IMPLEMENTATION=rmw_zenoh_cpp \
@@ -116,6 +118,7 @@ pixi run env \
   AIC_CHEATCODE_PERTURB_PROB="${AIC_CHEATCODE_PERTURB_PROB:-1.0}" \
   AIC_CHEATCODE_PERTURB_XY_MIN_M="${AIC_CHEATCODE_PERTURB_XY_MIN_M:-0.005}" \
   AIC_CHEATCODE_PERTURB_XY_MAX_M="${AIC_CHEATCODE_PERTURB_XY_MAX_M:-0.015}" \
+  AIC_CHEATCODE_SC_FINAL_PERTURB_SCALE="${AIC_CHEATCODE_SC_FINAL_PERTURB_SCALE:-1.0}" \
   AIC_CHEATCODE_PERTURB_Z_MAX_M="${AIC_CHEATCODE_PERTURB_Z_MAX_M:-0.0}" \
   AIC_CHEATCODE_PERTURB_DURATION_S="${AIC_CHEATCODE_PERTURB_DURATION_S:-0.50}" \
   AIC_CHEATCODE_PERTURB_SEED="${AIC_CHEATCODE_PERTURB_SEED:-37}" \
@@ -179,6 +182,11 @@ echo "AUDIT_RC=$AUDIT_RC" >> "$STATUS_FILE"
 if [[ "$AUDIT_RC" -ne 0 ]]; then
   log "audit failed; refusing to train"
   exit 3
+fi
+
+if [[ "${SKIP_TRAIN:-0}" == "1" ]]; then
+  log "SKIP_TRAIN=1; collection, validation, and audit complete"
+  exit 0
 fi
 
 log "starting ACT fine-tune"

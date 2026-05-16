@@ -90,6 +90,9 @@ class CheatCode(Policy):
         self._final_perturb_trigger_z_m = float(
             os.environ.get("AIC_CHEATCODE_FINAL_PERTURB_TRIGGER_Z_M", "0.08")
         )
+        self._sc_final_perturb_scale = float(
+            os.environ.get("AIC_CHEATCODE_SC_FINAL_PERTURB_SCALE", "1.0")
+        )
         perturb_seed_raw = os.environ.get("AIC_CHEATCODE_PERTURB_SEED", "").strip()
         self._perturb_rng = (
             np.random.default_rng(int(perturb_seed_raw))
@@ -125,7 +128,8 @@ class CheatCode(Policy):
                 f"xy=[{self._perturb_xy_min_m * 1000:.1f}, "
                 f"{self._perturb_xy_max_m * 1000:.1f}]mm "
                 f"z_max={self._perturb_z_max_m * 1000:.1f}mm "
-                f"duration={self._perturb_duration_s:.2f}s"
+                f"duration={self._perturb_duration_s:.2f}s "
+                f"sc_final_scale={self._sc_final_perturb_scale:.2f}"
             )
 
     def _set_perturbing(self, value: bool) -> None:
@@ -151,13 +155,16 @@ class CheatCode(Policy):
         )
         return None
 
-    def _sample_perturbation(self) -> tuple[float, float, float]:
+    def _sample_perturbation(self, xy_scale: float = 1.0) -> tuple[float, float, float]:
         lo = min(self._perturb_xy_min_m, self._perturb_xy_max_m)
         hi = max(self._perturb_xy_min_m, self._perturb_xy_max_m)
-        radius = float(self._perturb_rng.uniform(lo, hi))
+        radius = float(self._perturb_rng.uniform(lo, hi) * max(xy_scale, 0.0))
         angle = float(self._perturb_rng.uniform(0.0, 2.0 * np.pi))
         z = float(self._perturb_rng.uniform(0.0, max(self._perturb_z_max_m, 0.0)))
         return radius * np.cos(angle), radius * np.sin(angle), z
+
+    def _is_sc_task(self, task: Task) -> bool:
+        return "sc" in task.plug_name.lower() or "sc" in task.port_name.lower()
 
     def _combine_xy_offsets(
         self, lhs: tuple[float, float], rhs: tuple[float, float]
@@ -361,10 +368,16 @@ class CheatCode(Policy):
         perturb_xyz = (0.0, 0.0, 0.0)
         perturb_steps = max(1, int(self._perturb_duration_s / 0.05))
         if perturb_stage is not None:
-            perturb_xyz = self._sample_perturbation()
+            perturb_xy_scale = (
+                self._sc_final_perturb_scale
+                if perturb_stage == "final" and self._is_sc_task(task)
+                else 1.0
+            )
+            perturb_xyz = self._sample_perturbation(xy_scale=perturb_xy_scale)
             self.get_logger().warn(
                 "CheatCode perturbation episode: "
                 f"stage={perturb_stage} "
+                f"xy_scale={perturb_xy_scale:.2f} "
                 f"dx={perturb_xyz[0] * 1000:.1f}mm "
                 f"dy={perturb_xyz[1] * 1000:.1f}mm "
                 f"dz={perturb_xyz[2] * 1000:.1f}mm "

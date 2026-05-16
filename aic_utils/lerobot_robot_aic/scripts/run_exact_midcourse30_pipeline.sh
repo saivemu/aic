@@ -193,6 +193,7 @@ log "starting ACT fine-tune"
 pixi run lerobot-train \
   --dataset.repo_id="$REPO_ID" \
   --dataset.root="$DATASET_ROOT" \
+  --dataset.video_backend=pyav \
   --policy.type=act \
   --policy.pretrained_path="$ROOT/outputs/plan_d/pretrained_model" \
   --policy.device=cuda \

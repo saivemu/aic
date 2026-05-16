@@ -1,0 +1,42 @@
+# Self-contained ACT checkpoint submission image.
+#
+# Build from the repository root, overriding POLICY_SRC for the checkpoint to
+# ship:
+#
+#   docker build \
+#     -t aic-runact:act-clean25-1489-v1 \
+#     -f docker/aic_model/Dockerfile.act_checkpoint_submission \
+#     --build-arg POLICY_SRC=outputs/train/act_final_recovery30_scscaled_clean25_v1/checkpoints/010000/pretrained_model \
+#     .
+#
+# Then tag/push to the assigned ECR repository:
+#
+#   docker tag aic-runact:act-clean25-1489-v1 \
+#     973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/bot-squad-l2-learning-loop:act-clean25-1489-v1
+#   docker push \
+#     973918476471.dkr.ecr.us-east-1.amazonaws.com/aic-team/bot-squad-l2-learning-loop:act-clean25-1489-v1
+
+FROM aic-runact:plans-bc
+
+ARG POLICY_SRC=outputs/train/act_final_recovery30_scscaled_clean25_v1/checkpoints/010000/pretrained_model
+COPY ${POLICY_SRC} /opt/policy_candidate
+
+COPY --chmod=755 <<"EOF" /entrypoint_act_checkpoint_submission.sh
+#!/bin/bash
+set -e
+
+export AIC_POLICY_PATH=/opt/policy_candidate
+export AIC_POLICY_PLAN=d
+export AIC_ENABLE_FINAL_SEARCH=
+export AIC_INSERT_POLICY_PATH=
+export AIC_VISUAL_SERVO_MODEL_PATH=
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+
+echo "act_checkpoint_submission entrypoint: forced ACT checkpoint"
+echo "  AIC_POLICY_PATH=$AIC_POLICY_PATH"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_act_checkpoint_submission.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

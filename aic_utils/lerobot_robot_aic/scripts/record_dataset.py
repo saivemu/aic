@@ -33,6 +33,7 @@ from aic_control_interfaces.msg import MotionUpdate, TrajectoryGenerationMode
 from aic_model_interfaces.msg import Observation
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_robot_aic.recording_utils import pose_targets_to_action, stamp_to_nanoseconds
@@ -123,6 +124,7 @@ class DatasetRecorder(Node):
         min_episode_frames: int,
         task_description: str,
         trial_task_list: list[tuple[str, str, str]],
+        perturbing_topic: str,
         resume: bool = False,
     ):
         super().__init__("dataset_recorder")
@@ -138,11 +140,14 @@ class DatasetRecorder(Node):
         self.episode_in_progress = False
         self.frames_in_episode = 0
         self.frames_skipped_stale_action = 0
+        self.frames_skipped_perturbing = 0
         self.unsupported_command_count = 0
         self.episodes_saved = 0
         self.episodes_dropped = 0
         self._consecutive_save_failures = 0
         self._max_consecutive_save_failures = 2  # exit & finalize after N in a row
+        self.perturbing = False
+        self.last_action_is_perturbing = False
 
         # Trial-task indexing. The recorder snoops topics, not the action goal,
         # so we sync the task identity off the trial config + an attempt counter.
@@ -207,11 +212,19 @@ class DatasetRecorder(Node):
         self.create_subscription(
             MotionUpdate, "/aic_controller/pose_commands", self._on_pose_command, action_qos
         )
+        if perturbing_topic:
+            self.create_subscription(Bool, perturbing_topic, self._on_perturbing, action_qos)
+            self.get_logger().info(
+                f"Skipping frames while {perturbing_topic} publishes true."
+            )
 
         # Periodic episode-end check
         self.create_timer(0.5, self._check_episode_end)
 
     # ------------------------------------------------------------------ subscribers
+
+    def _on_perturbing(self, msg: Bool) -> None:
+        self.perturbing = bool(msg.data)
 
     def _on_pose_command(self, msg: MotionUpdate) -> None:
         # MotionUpdate has both velocity and pose fields. CheatCode uses
@@ -266,6 +279,7 @@ class DatasetRecorder(Node):
 
         if action is not None:
             self.last_action = action
+            self.last_action_is_perturbing = self.perturbing
             self.last_action_time = now
             if not self.episode_in_progress:
                 self._start_episode()
@@ -369,6 +383,9 @@ class DatasetRecorder(Node):
         obs = self.last_observation
         action = self.last_action
         if obs is None or action is None:
+            return
+        if self.perturbing or self.last_action_is_perturbing:
+            self.frames_skipped_perturbing += 1
             return
         if self.last_action_time is not None and self.max_action_age_ns > 0:
             action_age = (self.get_clock().now() - self.last_action_time).nanoseconds
@@ -484,6 +501,11 @@ def main() -> None:
         "state vector carries a Plan-D one-hot task encoding. MUST be the same file the "
         "engine is loading.",
     )
+    parser.add_argument(
+        "--perturbing-topic",
+        default="/aic/cheatcode/perturbing",
+        help="Bool topic used to skip artificial perturbation frames. Set to '' to disable.",
+    )
     args = parser.parse_args()
 
     if args.root is None:
@@ -506,6 +528,7 @@ def main() -> None:
         min_episode_frames=args.min_episode_frames,
         task_description=args.task_description,
         trial_task_list=trial_task_list,
+        perturbing_topic=args.perturbing_topic,
         resume=args.resume,
     )
     # On --resume, restart the attempt counter at the saved-episodes mark.
@@ -530,6 +553,7 @@ def main() -> None:
             f"Recorder shutting down. saved={recorder.episodes_saved} "
             f"dropped={recorder.episodes_dropped} "
             f"stale_action_frames={recorder.frames_skipped_stale_action} "
+            f"perturbing_frames={recorder.frames_skipped_perturbing} "
             f"unsupported_commands={recorder.unsupported_command_count}"
         )
         recorder.destroy_node()

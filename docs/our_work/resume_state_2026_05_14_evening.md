@@ -77,8 +77,8 @@ the new plans yet — the call is yours after Plan G eval lands.
 
 - Plan F runtime: `aic_example_policies/aic_example_policies/ros/RunACT.py`, `docker/docker-compose.yaml`
 - Plan F image recipes: `docker/aic_model/Dockerfile.assist_pixel_zstiff`, `docker/aic_model/Dockerfile.planE_pixel`
-- Overnight log: `docs/overnight_2026_05_14_progress.md`
-- Status tracker: `docs/status.md` (Plan F-safe and F-aggressive rows added)
+- Overnight log: `docs/our_work/overnight_2026_05_14_progress.md`
+- Status tracker: `docs/our_work/status.md` (Plan F-safe and F-aggressive rows added)
 - Experiment artifacts: `outputs/experiments/overnight_2026_05_14/*` (env files, compose overlays, run script, summaries)
 
 ## What was actually disconnected for the move

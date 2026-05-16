@@ -18,7 +18,7 @@
 ## LeRobot Data collection and Training
 
 - [lerobot_robot_aic](../aic_utils/lerobot_robot_aic/README.md#recording-training-data): [LeRobot](https://huggingface.co/lerobot) integration with AIC, which enables teleoperation and dataset recording using LeRobot
-- [CheatCode LeRobot dataset collection](./cheatcode_dataset_collection.md): training-only flow for generating LeRobot demonstrations from the ground-truth CheatCode policy, auditing the recorded actions, and evaluating checkpoints
+- [CheatCode LeRobot dataset collection](./our_work/cheatcode_dataset_collection.md): training-only flow for generating LeRobot demonstrations from the ground-truth CheatCode policy, auditing the recorded actions, and evaluating checkpoints
 
 ## Plotting
 

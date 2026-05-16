@@ -90,7 +90,7 @@ sleep 3
 
 log "starting RunACT model"
 pixi run env \
-  PYTHONPATH="$ROOT/aic_example_policies:$ROOT/.pixi/envs/default/lib/python/site-packages:$ROOT/.pixi/envs/default/lib/python3.12/site-packages" \
+  PYTHONPATH="$ROOT/aic_example_policies:$ROOT/aic_utils/lerobot_robot_aic:$ROOT/.pixi/envs/default/lib/python/site-packages:$ROOT/.pixi/envs/default/lib/python3.12/site-packages" \
   RMW_IMPLEMENTATION=rmw_zenoh_cpp \
   ZENOH_ROUTER_CHECK_ATTEMPTS=-1 \
   ZENOH_CONFIG_OVERRIDE=transport/shared_memory/enabled=false \

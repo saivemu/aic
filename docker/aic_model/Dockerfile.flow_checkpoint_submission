@@ -1,0 +1,54 @@
+# Self-contained ACT + rectified-flow checkpoint submission image.
+#
+# Build from the repository root, overriding POLICY_SRC and FLOW_POLICY_SRC:
+#
+#   docker build \
+#     -t aic-runact:flow-mixedfinal-v1 \
+#     -f docker/aic_model/Dockerfile.flow_checkpoint_submission \
+#     --build-arg POLICY_SRC=outputs/train/act_final_recovery30_scscaled_clean25_v1/checkpoints/010000/pretrained_model \
+#     --build-arg FLOW_POLICY_SRC=outputs/train/flow_mixedfull1_final180x4_v1/checkpoints/000500 \
+#     .
+
+FROM aic-runact:plans-bc
+
+ARG POLICY_SRC=outputs/train/act_final_recovery30_scscaled_clean25_v1/checkpoints/010000/pretrained_model
+ARG FLOW_POLICY_SRC=outputs/train/flow_mixedfull1_final180x4_v1/checkpoints/000500
+
+COPY ${POLICY_SRC} /opt/policy_candidate
+COPY ${FLOW_POLICY_SRC} /opt/flow_policy
+
+# The base image is intentionally stable, so overlay the current runner and
+# helper package files required by the flow handoff.
+COPY aic_example_policies/aic_example_policies/. \
+  /ws_aic/src/aic/.pixi/envs/default/lib/python3.12/site-packages/aic_example_policies/
+COPY aic_utils/lerobot_robot_aic/lerobot_robot_aic/. \
+  /ws_aic/src/aic/.pixi/envs/default/lib/python3.12/site-packages/lerobot_robot_aic/
+
+COPY --chmod=755 <<"EOF" /entrypoint_flow_checkpoint_submission.sh
+#!/bin/bash
+set -e
+
+export AIC_POLICY_PATH=/opt/policy_candidate
+export AIC_POLICY_PLAN=d
+export AIC_FLOW_POLICY_PATH=/opt/flow_policy
+export AIC_FLOW_POLICY_START_S=8.0
+export AIC_FLOW_POLICY_MODE=xy_down
+export AIC_FLOW_POLICY_MAX_XY_SPEED_MPS=0.020
+export AIC_FLOW_POLICY_DOWN_VZ_MPS=-0.006
+export AIC_FLOW_POLICY_STEPS=4
+export AIC_FLOW_POLICY_REPLAN_EVERY=4
+export AIC_ENABLE_FINAL_SEARCH=
+export AIC_INSERT_POLICY_PATH=
+export AIC_VISUAL_SERVO_MODEL_PATH=
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+
+echo "flow_checkpoint_submission entrypoint: ACT base + flow final-stage handoff"
+echo "  AIC_POLICY_PATH=$AIC_POLICY_PATH"
+echo "  AIC_FLOW_POLICY_PATH=$AIC_FLOW_POLICY_PATH"
+echo "  AIC_FLOW_POLICY_MODE=$AIC_FLOW_POLICY_MODE"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_flow_checkpoint_submission.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

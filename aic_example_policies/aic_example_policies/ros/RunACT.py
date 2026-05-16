@@ -193,6 +193,19 @@ class RunACT(Policy):
         self.policy.load_state_dict(load_file(model_weights_path))
         self.policy.eval()
         self.policy.to(self.device)
+        self.sc_policy = None
+        self.sc_policy_plug_types = {"sc"}
+        self._sc_state_norm_mode = None
+        self._sc_action_norm_mode = None
+        self.sc_img_stats = None
+        self.sc_state_mean = None
+        self.sc_state_std = None
+        self.sc_state_min = None
+        self.sc_state_max = None
+        self.sc_action_mean = None
+        self.sc_action_std = None
+        self.sc_action_min = None
+        self.sc_action_max = None
         self.insert_policy = None
         self._insert_state_norm_mode = None
         self._insert_action_norm_mode = None
@@ -271,6 +284,105 @@ class RunACT(Policy):
             f"(includes_wrench_and_task={self._state_includes_wrench_and_task}) "
             f"image_scaling={self.image_scaling:.3f}"
         )
+
+        sc_policy_raw = os.environ.get("AIC_SC_POLICY_PATH", "").strip()
+        sc_policy_plug_types_raw = os.environ.get("AIC_SC_POLICY_PLUG_TYPES", "sc").strip()
+        self.sc_policy_plug_types = {
+            value.strip()
+            for value in sc_policy_plug_types_raw.split(",")
+            if value.strip()
+        }
+        if sc_policy_raw:
+            sc_policy_path = Path(sc_policy_raw).expanduser()
+            if not sc_policy_path.exists():
+                raise FileNotFoundError(f"AIC_SC_POLICY_PATH does not exist: {sc_policy_path}")
+            with open(sc_policy_path / "config.json", "r") as f:
+                sc_config_dict = json.load(f)
+            sc_policy_type = sc_config_dict.pop("type", "act")
+            if sc_policy_type != "act":
+                raise ValueError(
+                    f"AIC_SC_POLICY_PATH must point to an ACT checkpoint, got {sc_policy_type!r}"
+                )
+
+            sc_norm_map = sc_config_dict.get("normalization_mapping", {})
+            self._sc_state_norm_mode = sc_norm_map.get("STATE", "MEAN_STD")
+            self._sc_action_norm_mode = sc_norm_map.get("ACTION", "MEAN_STD")
+            sc_input_features = sc_config_dict.get("input_features", {})
+            sc_state_shape = sc_input_features.get("observation.state", {}).get("shape", [])
+            sc_img_shape = sc_input_features.get(
+                "observation.images.center_camera", {}
+            ).get("shape", [])
+            if int(sc_state_shape[0]) != self._expected_state_dim:
+                raise ValueError(
+                    f"SC policy state dim {sc_state_shape} does not match "
+                    f"base policy state dim {self._expected_state_dim}"
+                )
+            if tuple(sc_img_shape) != tuple(img_shape):
+                raise ValueError(
+                    f"SC policy image shape {sc_img_shape} does not match "
+                    f"base policy image shape {img_shape}; routed policies must "
+                    "share the inference schema."
+                )
+
+            sc_config = draccus.decode(ACTConfig, sc_config_dict)
+            self.sc_policy = ACTPolicy(sc_config)
+            self.sc_policy.load_state_dict(load_file(sc_policy_path / "model.safetensors"))
+            self.sc_policy.eval()
+            self.sc_policy.to(self.device)
+
+            sc_stats = load_file(
+                sc_policy_path / "policy_preprocessor_step_3_normalizer_processor.safetensors"
+            )
+
+            def get_sc_stat(key, shape):
+                return sc_stats[key].to(self.device).view(*shape)
+
+            self.sc_img_stats = {
+                "left": {
+                    "mean": get_sc_stat("observation.images.left_camera.mean", (1, 3, 1, 1)),
+                    "std": self._safe_denominator(
+                        get_sc_stat("observation.images.left_camera.std", (1, 3, 1, 1))
+                    ),
+                },
+                "center": {
+                    "mean": get_sc_stat("observation.images.center_camera.mean", (1, 3, 1, 1)),
+                    "std": self._safe_denominator(
+                        get_sc_stat("observation.images.center_camera.std", (1, 3, 1, 1))
+                    ),
+                },
+                "right": {
+                    "mean": get_sc_stat("observation.images.right_camera.mean", (1, 3, 1, 1)),
+                    "std": self._safe_denominator(
+                        get_sc_stat("observation.images.right_camera.std", (1, 3, 1, 1))
+                    ),
+                },
+            }
+            if self._sc_state_norm_mode == "MEAN_STD":
+                self.sc_state_mean = get_sc_stat("observation.state.mean", (1, -1))
+                self.sc_state_std = self._safe_denominator(
+                    get_sc_stat("observation.state.std", (1, -1))
+                )
+            elif self._sc_state_norm_mode == "MIN_MAX":
+                self.sc_state_min = get_sc_stat("observation.state.min", (1, -1))
+                self.sc_state_max = get_sc_stat("observation.state.max", (1, -1))
+            else:
+                raise ValueError(f"Unsupported SC state norm mode: {self._sc_state_norm_mode!r}")
+            if self._sc_action_norm_mode == "MEAN_STD":
+                self.sc_action_mean = get_sc_stat("action.mean", (1, -1))
+                self.sc_action_std = get_sc_stat("action.std", (1, -1))
+            elif self._sc_action_norm_mode == "MIN_MAX":
+                self.sc_action_min = get_sc_stat("action.min", (1, -1))
+                self.sc_action_max = get_sc_stat("action.max", (1, -1))
+            else:
+                raise ValueError(
+                    f"Unsupported SC action norm mode: {self._sc_action_norm_mode!r}"
+                )
+            self.get_logger().warn(
+                f"SC routed ACT loaded from {sc_policy_path}; "
+                f"plug_types={sorted(self.sc_policy_plug_types)} "
+                f"(state_norm={self._sc_state_norm_mode}, "
+                f"action_norm={self._sc_action_norm_mode})"
+            )
 
         insert_policy_raw = os.environ.get("AIC_INSERT_POLICY_PATH", "").strip()
         self.insert_policy_start_s = float(os.environ.get("AIC_INSERT_POLICY_START_S", "8.0"))
@@ -1086,6 +1198,15 @@ class RunACT(Policy):
             state_std = self.insert_state_std
             state_min = self.insert_state_min
             state_max = self.insert_state_max
+        elif norm_source == "sc":
+            if self.sc_img_stats is None:
+                raise RuntimeError("SC normalization requested before SC policy is loaded")
+            img_stats = self.sc_img_stats
+            state_norm_mode = self._sc_state_norm_mode
+            state_mean = self.sc_state_mean
+            state_std = self.sc_state_std
+            state_min = self.sc_state_min
+            state_max = self.sc_state_max
         elif norm_source == "base":
             img_stats = self.img_stats
             state_norm_mode = self._state_norm_mode
@@ -1194,6 +1315,12 @@ class RunACT(Policy):
             action_std = self.insert_action_std
             action_min = self.insert_action_min
             action_max = self.insert_action_max
+        elif norm_source == "sc":
+            action_norm_mode = self._sc_action_norm_mode
+            action_mean = self.sc_action_mean
+            action_std = self.sc_action_std
+            action_min = self.sc_action_min
+            action_max = self.sc_action_max
         elif norm_source == "base":
             action_norm_mode = self._action_norm_mode
             action_mean = self.action_mean
@@ -1237,16 +1364,32 @@ class RunACT(Policy):
           gravity_compensation_action; no feedforward needed in MotionUpdate.
         """
         self.policy.reset()
+        if self.sc_policy is not None:
+            self.sc_policy.reset()
         if self.insert_policy is not None:
             self.insert_policy.reset()
         if self.flow_policy is not None:
             self.flow_policy.reset()
         self.get_logger().info(f"RunACT.insert_cable() enter. Task: {task}")
 
+        use_sc_policy = (
+            self.sc_policy is not None
+            and task.plug_type in self.sc_policy_plug_types
+        )
+        active_policy = self.sc_policy if use_sc_policy else self.policy
+        active_norm_source = "sc" if use_sc_policy else "base"
+        if use_sc_policy:
+            self.get_logger().warn(
+                "Routing task to SC specialist policy "
+                f"(plug_type={task.plug_type}, target={task.target_module_name}, "
+                f"port={task.port_name})"
+            )
+
         # Build the task identity one-hot exactly as record_dataset.py does for
         # training data. Stays at zeros for Plan B (state dim 26) checkpoints.
         if (
             self._state_includes_wrench_and_task
+            or self.sc_policy is not None
             or self.visual_servo_model is not None
             or self.flow_policy is not None
         ):
@@ -1382,10 +1525,16 @@ class RunACT(Policy):
             # per call. ACT: 1 inference per tick (n_action_steps=1). Diffusion: 1
             # inference every 8 ticks with chunk replay (n_action_steps=8); managed
             # internally by the policy's action queue.
-            obs_tensors = self.prepare_observations(observation_msg)
+            obs_tensors = self.prepare_observations(
+                observation_msg,
+                norm_source=active_norm_source,
+            )
             with torch.inference_mode():
-                normalized_action = self.policy.select_action(obs_tensors)
-            raw_action_tensor = self._unnormalize_action_tensor(normalized_action)
+                normalized_action = active_policy.select_action(obs_tensors)
+            raw_action_tensor = self._unnormalize_action_tensor(
+                normalized_action,
+                norm_source=active_norm_source,
+            )
             scaled_action_tensor = raw_action_tensor * self.ACTION_SCALE
             raw_action = raw_action_tensor[0].cpu().numpy()
             action = scaled_action_tensor[0].cpu().numpy()
@@ -1450,6 +1599,7 @@ class RunACT(Policy):
                 trial_elapsed_s = (sim_now - trial_start).nanoseconds * 1e-9
                 if (
                     mode_label != "BACKOFF"
+                    and final_helper_allowed
                     and self.insert_policy is not None
                     and trial_elapsed_s >= self.insert_policy_start_s
                 ):
@@ -1493,6 +1643,7 @@ class RunACT(Policy):
                 visual_servo_debug = ""
                 if (
                     mode_label != "BACKOFF"
+                    and final_helper_allowed
                     and self.flow_policy is not None
                     and trial_elapsed_s >= self.flow_policy_start_s
                 ):

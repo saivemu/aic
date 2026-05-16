@@ -281,7 +281,7 @@ Modified:
 
 Untracked:
 - `outputs/experiments/overnight_2026_05_14/` — env files, logs, summaries.
-- `docs/overnight_2026_05_14_progress.md` — this file.
+- `docs/our_work/overnight_2026_05_14_progress.md` — this file.
 
 To reproduce the best Plan E baseline:
 ```bash

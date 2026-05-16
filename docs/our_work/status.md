@@ -1,6 +1,6 @@
 # Project status — AIC cable insertion
 
-Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-14 (overnight round). If anything below disagrees with reality, fix this doc.
+Single source of truth for what's been done, what's shipped, and what's still open. Last updated 2026-05-15. If anything below disagrees with reality, fix this doc.
 
 **Companion docs you'll want open:**
 - 🔴 **[`resume_state_2026_05_14_evening.md`](resume_state_2026_05_14_evening.md)** — pinned resume context after the 2026-05-14 evening workstation move. Read this first if returning from a power-off.
@@ -9,6 +9,7 @@ Single source of truth for what's been done, what's shipped, and what's still op
 - [`cheatcode_dataset_collection.md`](cheatcode_dataset_collection.md) — the operational recipe for running the eval-stack + CheatCode + recorder pipeline. The how-to behind the dataset rows in the tracker below.
 - [`cheatcode_training_notes.md`](cheatcode_training_notes.md) — implementation details for the recorder + training side (recorder QoS, action synthesis, episode boundaries).
 - [`visual_servo_experiment_log.md`](visual_servo_experiment_log.md) — May-14 final-alignment experiments, scores, dead ends, and next steps.
+- [`final_approach_recovery_dataset_plan.md`](final_approach_recovery_dataset_plan.md) — current plan for a clean, guaranteed-insertion recovery dataset.
 - See the full doc map at the bottom.
 
 ## Tracker at a glance
@@ -22,12 +23,14 @@ Single source of truth for what's been done, what's shipped, and what's still op
 | **E** | Plan D + optional final visual servo/search/insertion handoff | local TF-labeled visual-servo data | 43-D | 576×512 | **124.85 best local** ³ | experimental, not shipped |
 | **F-safe** | Plan D + pixel_delta VS in ASSIST mode + z-stiffness 500 N/m boost during VS | same as E | 43-D | 576×512 | **127.77 mean / 128.41 max (5-run)** ⁴ | **pushed to ECR 2026-05-14 as `assist-pixel-zstiff-v1`**, not yet submitted |
 | **F-aggressive** | Plan D + pixel_delta VS in REPLACE mode | same as E | 43-D | 576×512 | **124.5 mean / 139.02 max (3-run)** ⁵ | **pushed to ECR 2026-05-14 as `plane-pixel-v1`**, not yet submitted |
+| **Exact clean28** | ACT, 10k steps | exact no-perturb 30, bad trials 6/15 excluded | 43-D | 576×512 | **127.29 plain / 139.91 with F-safe assist** ⁶ | local only; current best local score but still not reliable full insertion |
 
 ¹ Plan B as recorded May-5 from image `aic-runact:plan-b-v3`. Rebuilding the same source today gets 103.6 due to a cuDNN kernel-selection drift; this is the rebuild-variance floor we used to set Plan D's 115 ship gate.
 ² Plan D: min over 3 back-to-back compose runs is 123.06; variance 0.5 pts.
 ³ Plan E best is the xy-direction visual-servo branch. It improved local proximity score slightly but did not create contact or insertion, so it is not yet a >150 path.
 ⁴ Plan F-safe 5 compose runs: 127.25 / 127.49 / 127.67 / 128.03 / 128.41. Tight 1.16 pt spread. **+4.7 over Plan D shipped.** Tier 3 still proximity-only (no full insertions), but ASSIST mode + boosted z stiffness reliably pulls the gripper closer.
 ⁵ Plan F-aggressive 3 runs: 110.54 / 124.03 / 139.02. **Trial 2 of the 139 run actually scored Tier-3 = 38 (partial insertion)** — the first config tonight to break into the partial-insertion band. 28-pt spread makes it a high-variance bet for a single cluster submission.
+⁶ Exact clean28: collected 30 exact no-perturb trials, kept 28 full-insertion episodes after validation failures on trials 6 and 15. Plain ACT scored 127.29. ACT + F-safe pixel-delta/z-stiff assist scored 139.91, with trial 1 partial insertion and trials 2/3 still proximity-only. Long-range visual-servo assist scored 110.94 and should be discarded.
 
 ## What's currently shipped
 
@@ -63,6 +66,26 @@ reliably converts into contact/insertion.
 
 Full details, artifact paths, commands, and the recommended next order are in
 [`visual_servo_experiment_log.md`](visual_servo_experiment_log.md).
+
+## May-15 exact-data pass
+
+The exact no-perturb 30-episode collection validated the data-quality concern:
+CheatCode can mostly score full insertion on the visible trial families, but not
+every episode is clean. Validation found 28/30 full insertions; trials 6 and 15
+were partial insertions and were excluded before training.
+
+Training ACT on the 28 clean episodes improved over the old Plan D baseline but
+did not solve insertion:
+
+| Candidate | Local score | Result |
+|---|---:|---|
+| ACT clean28 plain | 127.29 | no insertions |
+| ACT clean28 + F-safe assist | 139.91 | one partial insertion, two proximity-only trials |
+| ACT clean28 + long-range visual-servo assist | 110.94 | worse; discard |
+
+The useful conclusion is that exact successful demonstrations are necessary but
+not sufficient. The next dataset needs clean final-approach recovery episodes,
+not just more ideal-path insertions.
 
 ## Datasets on disk / Hub
 
@@ -172,3 +195,5 @@ These will bite if anyone rebuilds the environment from scratch:
 | [`cheatcode_training_notes.md`](cheatcode_training_notes.md) | Implementation notes for the recorder/training side. |
 | [`visual_servo_experiment_log.md`](visual_servo_experiment_log.md) | May-14 visual-servo/final-alignment experiment log and next-step order. |
 | [`overnight_2026_05_14_progress.md`](overnight_2026_05_14_progress.md) | May-14 overnight log: 14 configs swept, ASSIST-mode pixel_delta + z-stiffness breakthrough (mean 127.77), both Plan F images pushed to ECR. |
+| [`perturbed_cheatcode_dataset_plan.md`](perturbed_cheatcode_dataset_plan.md) | Perturbation-data plan and 2026-05-15 smoke validation. |
+| [`final_approach_recovery_dataset_plan.md`](final_approach_recovery_dataset_plan.md) | Current plan for a clean, full-insertion final-recovery training dataset. |

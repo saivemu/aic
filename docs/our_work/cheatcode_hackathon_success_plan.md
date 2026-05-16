@@ -1026,8 +1026,8 @@ Tests:
 
 Docs:
 
-- `docs/cheatcode_dataset_collection.md`
-- `docs/cheatcode_training_notes.md`
+- `docs/our_work/cheatcode_dataset_collection.md`
+- `docs/our_work/cheatcode_training_notes.md`
 - this file
 
 ## Implementation Checklist

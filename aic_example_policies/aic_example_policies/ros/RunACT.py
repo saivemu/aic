@@ -121,20 +121,26 @@ class RunACT(Policy):
         # at /opt/policy_b and /opt/policy_c. The AIC_POLICY_PLAN env var (set in
         # docker-compose.yaml) selects one without a rebuild. Defaults to Plan B
         # since it scored 112.90 vs Plan C's 86.03 in compose eval.
-        plan = os.environ.get("AIC_POLICY_PLAN", "b").lower()
-        if plan not in ("b", "c", "d"):
-            raise ValueError(
-                f"AIC_POLICY_PLAN must be 'b', 'c', or 'd' (got {plan!r}). "
-                "b = Plan B (ACT 300 ep, 26-D state). "
-                "c = Plan C (Diffusion 300 ep). "
-                "d = Plan D (ACT 299 ep, 43-D state with wrench + task one-hot)."
-            )
-        policy_path = Path(f"/opt/policy_{plan}")
-        if not policy_path.exists():
-            # Non-docker fallback: workspace-relative path for local testing.
-            policy_path = Path(
-                f"/home/saivemu/code/aic/outputs/plan_{plan}/pretrained_model"
-            )
+        policy_path_raw = os.environ.get("AIC_POLICY_PATH", "").strip()
+        if policy_path_raw:
+            policy_path = Path(policy_path_raw).expanduser()
+            if not policy_path.exists():
+                raise FileNotFoundError(f"AIC_POLICY_PATH does not exist: {policy_path}")
+        else:
+            plan = os.environ.get("AIC_POLICY_PLAN", "b").lower()
+            if plan not in ("b", "c", "d"):
+                raise ValueError(
+                    f"AIC_POLICY_PLAN must be 'b', 'c', or 'd' (got {plan!r}). "
+                    "b = Plan B (ACT 300 ep, 26-D state). "
+                    "c = Plan C (Diffusion 300 ep). "
+                    "d = Plan D (ACT 299 ep, 43-D state with wrench + task one-hot)."
+                )
+            policy_path = Path(f"/opt/policy_{plan}")
+            if not policy_path.exists():
+                # Non-docker fallback: workspace-relative path for local testing.
+                policy_path = Path(
+                    f"/home/saivemu/code/aic/outputs/plan_{plan}/pretrained_model"
+                )
 
         # Load Config — dispatch on `type` field. We support ACT (MEAN_STD norm,
         # n_obs_steps=1, n_action_steps=1+temporal_ensemble) and Diffusion (MIN_MAX

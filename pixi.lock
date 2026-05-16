@@ -7991,6 +7991,7 @@ packages:
   - ros-kilted-geometry-msgs
   - transforms3d
   - ros-kilted-rclpy
+  - ros-kilted-std-msgs
   - ros-kilted-tf2-ros
   - ros-kilted-sensor-msgs
   - ros-kilted-std-srvs
@@ -8016,6 +8017,7 @@ packages:
   - ros-kilted-geometry-msgs
   - transforms3d
   - ros-kilted-rclpy
+  - ros-kilted-std-msgs
   - ros-kilted-tf2-ros
   - ros-kilted-sensor-msgs
   - ros-kilted-std-srvs

@@ -30,6 +30,7 @@ from aic_task_interfaces.msg import Task
 from geometry_msgs.msg import Point, Pose, Quaternion, Transform
 from rclpy.duration import Duration
 from rclpy.time import Time
+from std_msgs.msg import Bool
 from tf2_ros import TransformException
 from transforms3d._gohlketransforms import quaternion_multiply, quaternion_slerp
 
@@ -68,8 +69,41 @@ class CheatCode(Policy):
             if seed_raw
             else np.random.default_rng()
         )
+        self._perturb_mode = os.environ.get(
+            "AIC_CHEATCODE_PERTURB_MODE", "none"
+        ).strip().lower()
+        self._perturb_prob = float(
+            os.environ.get("AIC_CHEATCODE_PERTURB_PROB", "1.0")
+        )
+        self._perturb_xy_min_m = float(
+            os.environ.get("AIC_CHEATCODE_PERTURB_XY_MIN_M", "0.005")
+        )
+        self._perturb_xy_max_m = float(
+            os.environ.get("AIC_CHEATCODE_PERTURB_XY_MAX_M", "0.025")
+        )
+        self._perturb_z_max_m = float(
+            os.environ.get("AIC_CHEATCODE_PERTURB_Z_MAX_M", "0.0")
+        )
+        self._perturb_duration_s = float(
+            os.environ.get("AIC_CHEATCODE_PERTURB_DURATION_S", "1.0")
+        )
+        self._final_perturb_trigger_z_m = float(
+            os.environ.get("AIC_CHEATCODE_FINAL_PERTURB_TRIGGER_Z_M", "0.08")
+        )
+        perturb_seed_raw = os.environ.get("AIC_CHEATCODE_PERTURB_SEED", "").strip()
+        self._perturb_rng = (
+            np.random.default_rng(int(perturb_seed_raw))
+            if perturb_seed_raw
+            else np.random.default_rng()
+        )
+        self._perturbing = False
+        self._perturb_pub = None
         self._task = None
         super().__init__(parent_node)
+        self._perturb_pub = self._parent_node.create_publisher(
+            Bool, "/aic/cheatcode/perturbing", 10
+        )
+        self._set_perturbing(False)
         if (
             self._xy_i_gain != 0.15
             or self._xy_dither_amp_m > 0.0
@@ -84,6 +118,51 @@ class CheatCode(Policy):
                 f"offset_max={self._xy_offset_max_m * 1000:.1f}mm "
                 f"descent_step={self._descent_step_m * 1000:.2f}mm"
             )
+        if self._perturb_mode != "none":
+            self.get_logger().warn(
+                "Training-only CheatCode perturbation recovery enabled: "
+                f"mode={self._perturb_mode} prob={self._perturb_prob:.2f} "
+                f"xy=[{self._perturb_xy_min_m * 1000:.1f}, "
+                f"{self._perturb_xy_max_m * 1000:.1f}]mm "
+                f"z_max={self._perturb_z_max_m * 1000:.1f}mm "
+                f"duration={self._perturb_duration_s:.2f}s"
+            )
+
+    def _set_perturbing(self, value: bool) -> None:
+        self._perturbing = value
+        if self._perturb_pub is None:
+            return
+        msg = Bool()
+        msg.data = value
+        self._perturb_pub.publish(msg)
+
+    def _choose_perturb_stage(self) -> str | None:
+        if self._perturb_mode in ("", "none", "off", "false", "0"):
+            return None
+        if float(self._perturb_rng.uniform(0.0, 1.0)) > self._perturb_prob:
+            return None
+        if self._perturb_mode in ("midcourse", "final"):
+            return self._perturb_mode
+        if self._perturb_mode == "mixed":
+            return str(self._perturb_rng.choice(["midcourse", "final"]))
+        self.get_logger().warn(
+            f"Unknown AIC_CHEATCODE_PERTURB_MODE={self._perturb_mode!r}; "
+            "perturbation disabled for this episode."
+        )
+        return None
+
+    def _sample_perturbation(self) -> tuple[float, float, float]:
+        lo = min(self._perturb_xy_min_m, self._perturb_xy_max_m)
+        hi = max(self._perturb_xy_min_m, self._perturb_xy_max_m)
+        radius = float(self._perturb_rng.uniform(lo, hi))
+        angle = float(self._perturb_rng.uniform(0.0, 2.0 * np.pi))
+        z = float(self._perturb_rng.uniform(0.0, max(self._perturb_z_max_m, 0.0)))
+        return radius * np.cos(angle), radius * np.sin(angle), z
+
+    def _combine_xy_offsets(
+        self, lhs: tuple[float, float], rhs: tuple[float, float]
+    ) -> tuple[float, float]:
+        return lhs[0] + rhs[0], lhs[1] + rhs[1]
 
     def _wait_for_tf(
         self, target_frame: str, source_frame: str, timeout_sec: float = 10.0
@@ -278,10 +357,41 @@ class CheatCode(Policy):
                 f"dx={xy_offset[0] * 1000:.1f}mm dy={xy_offset[1] * 1000:.1f}mm"
             )
 
+        perturb_stage = self._choose_perturb_stage()
+        perturb_xyz = (0.0, 0.0, 0.0)
+        perturb_steps = max(1, int(self._perturb_duration_s / 0.05))
+        if perturb_stage is not None:
+            perturb_xyz = self._sample_perturbation()
+            self.get_logger().warn(
+                "CheatCode perturbation episode: "
+                f"stage={perturb_stage} "
+                f"dx={perturb_xyz[0] * 1000:.1f}mm "
+                f"dy={perturb_xyz[1] * 1000:.1f}mm "
+                f"dz={perturb_xyz[2] * 1000:.1f}mm "
+                f"steps={perturb_steps}"
+            )
+
         # Over five seconds, smoothly interpolate from the current position to
         # a position above the port.
+        midcourse_start_step = 50
+        midcourse_end_step = midcourse_start_step + perturb_steps
         for t in range(0, 100):
             interp_fraction = t / 100.0
+            midcourse_active = (
+                perturb_stage == "midcourse"
+                and midcourse_start_step <= t < midcourse_end_step
+            )
+            if midcourse_active and not self._perturbing:
+                self._set_perturbing(True)
+            elif not midcourse_active and self._perturbing:
+                self._set_perturbing(False)
+            pose_xy_offset = xy_offset
+            pose_z_offset = z_offset
+            if midcourse_active:
+                pose_xy_offset = self._combine_xy_offsets(
+                    pose_xy_offset, (perturb_xyz[0], perturb_xyz[1])
+                )
+                pose_z_offset += perturb_xyz[2]
             try:
                 self.set_pose_target(
                     move_robot=move_robot,
@@ -289,16 +399,20 @@ class CheatCode(Policy):
                         port_transform,
                         slerp_fraction=interp_fraction,
                         position_fraction=interp_fraction,
-                        z_offset=z_offset,
+                        z_offset=pose_z_offset,
                         reset_xy_integrator=True,
-                        xy_offset=xy_offset,
+                        xy_offset=pose_xy_offset,
                     ),
                 )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during interpolation: {ex}")
             self.sleep_for(0.05)
+        if self._perturbing:
+            self._set_perturbing(False)
 
         # Descend until the cable is inserted into the port.
+        final_perturb_started = False
+        final_perturb_steps_remaining = 0
         while True:
             if z_offset < -0.015:
                 break
@@ -306,6 +420,19 @@ class CheatCode(Policy):
             z_offset -= self._descent_step_m
             self.get_logger().info(f"z_offset: {z_offset:0.5}")
             try:
+                if final_perturb_started and final_perturb_steps_remaining == 0:
+                    if self._perturbing:
+                        self._set_perturbing(False)
+
+                if (
+                    perturb_stage == "final"
+                    and not final_perturb_started
+                    and z_offset <= self._final_perturb_trigger_z_m
+                ):
+                    final_perturb_started = True
+                    final_perturb_steps_remaining = perturb_steps
+                    self._set_perturbing(True)
+
                 decay_span = max(
                     self._xy_offset_decay_start_m - self._xy_offset_decay_end_m,
                     1e-6,
@@ -319,17 +446,27 @@ class CheatCode(Policy):
                     xy_offset[0] * offset_fraction,
                     xy_offset[1] * offset_fraction,
                 )
+                pose_xy_offset = decayed_xy_offset
+                pose_z_offset = z_offset
+                if final_perturb_steps_remaining > 0:
+                    pose_xy_offset = self._combine_xy_offsets(
+                        pose_xy_offset, (perturb_xyz[0], perturb_xyz[1])
+                    )
+                    pose_z_offset += perturb_xyz[2]
+                    final_perturb_steps_remaining -= 1
                 self.set_pose_target(
                     move_robot=move_robot,
                     pose=self.calc_gripper_pose(
                         port_transform,
-                        z_offset=z_offset,
-                        xy_offset=decayed_xy_offset,
+                        z_offset=pose_z_offset,
+                        xy_offset=pose_xy_offset,
                     ),
                 )
             except TransformException as ex:
                 self.get_logger().warn(f"TF lookup failed during insertion: {ex}")
             self.sleep_for(0.05)
+        if self._perturbing:
+            self._set_perturbing(False)
 
         self.get_logger().info("Waiting for connector to stabilize...")
         self.sleep_for(5.0)

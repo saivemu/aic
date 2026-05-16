@@ -1,0 +1,42 @@
+# Self-contained routed submission image.
+#
+# Build from the repository root with a strong SFP/base checkpoint and a
+# separate SC-specialist ACT checkpoint:
+#
+#   docker build \
+#     -t aic-runact:routed-sc-v1 \
+#     -f docker/aic_model/Dockerfile.routed_sc_submission \
+#     --build-arg BASE_POLICY_SRC=outputs/train/act_final_recovery30_scscaled_clean25_v1/checkpoints/010000/pretrained_model \
+#     --build-arg SC_POLICY_SRC=outputs/train/act_sc_exact_success_weighted_v1/checkpoints/003000/pretrained_model \
+#     .
+
+FROM aic-runact:plans-bc
+
+ARG BASE_POLICY_SRC=outputs/train/act_final_recovery30_scscaled_clean25_v1/checkpoints/010000/pretrained_model
+ARG SC_POLICY_SRC=outputs/train/act_sc_exact_success_weighted_v1/checkpoints/003000/pretrained_model
+
+COPY ${BASE_POLICY_SRC} /opt/policy_base
+COPY ${SC_POLICY_SRC} /opt/policy_sc
+
+COPY --chmod=755 <<"EOF" /entrypoint_routed_sc_submission.sh
+#!/bin/bash
+set -e
+
+export AIC_POLICY_PATH=/opt/policy_base
+export AIC_SC_POLICY_PATH=/opt/policy_sc
+export AIC_SC_POLICY_PLUG_TYPES=sc
+export AIC_POLICY_PLAN=d
+export AIC_ENABLE_FINAL_SEARCH=
+export AIC_INSERT_POLICY_PATH=
+export AIC_VISUAL_SERVO_MODEL_PATH=
+export AIC_FORCE_DESCENT_ENABLED=
+export AIC_MAX_TRIAL_S=30.0
+
+echo "routed_sc_submission entrypoint"
+echo "  AIC_POLICY_PATH=$AIC_POLICY_PATH"
+echo "  AIC_SC_POLICY_PATH=$AIC_SC_POLICY_PATH"
+exec /entrypoint.sh "$@"
+EOF
+
+ENTRYPOINT ["/entrypoint_routed_sc_submission.sh"]
+CMD ["--ros-args", "-p", "policy:=aic_example_policies.ros.RunACT", "-p", "use_sim_time:=true"]

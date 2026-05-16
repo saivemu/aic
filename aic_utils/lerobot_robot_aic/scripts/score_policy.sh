@@ -9,6 +9,7 @@ RUN_NAME="${RUN_NAME:-score_policy_$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-/home/saivemu/aic_runs/$RUN_NAME}"
 CONFIG="${CONFIG:-$ROOT/aic_engine/config/sample_config.yaml}"
 POLICY_PATH="${POLICY_PATH:-${AIC_POLICY_PATH:-}}"
+SC_POLICY_PATH="${SC_POLICY_PATH:-${AIC_SC_POLICY_PATH:-}}"
 RESULTS_DIR="$RUN_ROOT/results"
 LOG_DIR="$RUN_ROOT/logs"
 STATUS_FILE="$RUN_ROOT/status.env"
@@ -19,6 +20,10 @@ if [[ -z "$POLICY_PATH" ]]; then
 fi
 if [[ ! -d "$POLICY_PATH" ]]; then
   echo "POLICY_PATH does not exist: $POLICY_PATH" >&2
+  exit 66
+fi
+if [[ -n "$SC_POLICY_PATH" && ! -d "$SC_POLICY_PATH" ]]; then
+  echo "SC_POLICY_PATH does not exist: $SC_POLICY_PATH" >&2
   exit 66
 fi
 if [[ -e "$RUN_ROOT" ]]; then
@@ -58,6 +63,9 @@ log "run_name=$RUN_NAME"
 log "run_root=$RUN_ROOT"
 log "config=$CONFIG"
 log "policy_path=$POLICY_PATH"
+if [[ -n "$SC_POLICY_PATH" ]]; then
+  log "sc_policy_path=$SC_POLICY_PATH"
+fi
 log "results_dir=$RESULTS_DIR"
 
 {
@@ -65,6 +73,7 @@ log "results_dir=$RESULTS_DIR"
   echo "RUN_ROOT=$RUN_ROOT"
   echo "CONFIG=$CONFIG"
   echo "POLICY_PATH=$POLICY_PATH"
+  echo "SC_POLICY_PATH=$SC_POLICY_PATH"
   echo "RESULTS_DIR=$RESULTS_DIR"
 } >> "$STATUS_FILE"
 
@@ -95,6 +104,7 @@ pixi run env \
   ZENOH_ROUTER_CHECK_ATTEMPTS=-1 \
   ZENOH_CONFIG_OVERRIDE=transport/shared_memory/enabled=false \
   AIC_POLICY_PATH="$POLICY_PATH" \
+  AIC_SC_POLICY_PATH="$SC_POLICY_PATH" \
   ros2 run aic_model aic_model --ros-args \
     -p use_sim_time:=true \
     -p policy:=aic_example_policies.ros.RunACT \

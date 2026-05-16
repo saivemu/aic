@@ -436,6 +436,17 @@ class RunACT(Policy):
         # Per-trial task one-hot — populated in insert_cable() from the Task struct.
         # Stays zero for legacy (Plan B) checkpoints whose state vector is only 26-D.
         self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
+        final_helper_plug_types_raw = os.environ.get("AIC_FINAL_HELPER_PLUG_TYPES", "").strip()
+        self.final_helper_plug_types = {
+            value.strip()
+            for value in final_helper_plug_types_raw.split(",")
+            if value.strip()
+        }
+        if self.final_helper_plug_types:
+            self.get_logger().warn(
+                "Final-stage helpers gated to plug types: "
+                f"{sorted(self.final_helper_plug_types)}"
+            )
 
         # Optional learned final-stage visual servo. The model is trained from
         # TF-labeled images but at runtime consumes only Observation fields.
@@ -606,6 +617,72 @@ class RunACT(Policy):
                 f"radius={self.final_search_max_radius_m * 1000:.0f}mm "
                 f"xy_speed={self.final_search_max_xy_speed_mps * 1000:.1f}mm/s "
                 f"vz={self.final_search_down_vz_mps * 1000:.1f}mm/s"
+            )
+
+        # Pixel-error gated final insertion controller. This is a tighter hybrid
+        # than final_search: it only descends after a learned visual-servo head
+        # says port-minus-plug xy error is small and stable.
+        self.pixel_insert_enabled = (
+            os.environ.get("AIC_PIXEL_INSERT_ENABLED", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.pixel_insert_start_s = float(os.environ.get("AIC_PIXEL_INSERT_START_S", "12.0"))
+        self.pixel_insert_budget_s = float(os.environ.get("AIC_PIXEL_INSERT_BUDGET_S", "8.0"))
+        self.pixel_insert_xy_gate_m = float(os.environ.get("AIC_PIXEL_INSERT_XY_GATE_M", "0.010"))
+        self.pixel_insert_stable_ticks = int(os.environ.get("AIC_PIXEL_INSERT_STABLE_TICKS", "5"))
+        self.pixel_insert_xy_gain = float(os.environ.get("AIC_PIXEL_INSERT_XY_GAIN", "0.75"))
+        self.pixel_insert_max_xy_speed_mps = float(
+            os.environ.get("AIC_PIXEL_INSERT_MAX_XY_SPEED_MPS", "0.010")
+        )
+        self.pixel_insert_descend_vz_mps = float(
+            os.environ.get("AIC_PIXEL_INSERT_DESCEND_VZ_MPS", "-0.003")
+        )
+        self.pixel_insert_insert_vz_mps = float(
+            os.environ.get("AIC_PIXEL_INSERT_INSERT_VZ_MPS", "-0.005")
+        )
+        self.pixel_insert_contact_delta_n = float(
+            os.environ.get("AIC_PIXEL_INSERT_CONTACT_DELTA_N", "3.0")
+        )
+        self.pixel_insert_max_force_delta_n = float(
+            os.environ.get("AIC_PIXEL_INSERT_MAX_FORCE_DELTA_N", "14.0")
+        )
+        self.pixel_insert_descend_max_s = float(
+            os.environ.get("AIC_PIXEL_INSERT_DESCEND_MAX_S", "4.0")
+        )
+        self.pixel_insert_complete_depth_m = float(
+            os.environ.get("AIC_PIXEL_INSERT_COMPLETE_DEPTH_M", "0.008")
+        )
+        self.pixel_insert_z_stiffness = float(
+            os.environ.get("AIC_PIXEL_INSERT_Z_STIFFNESS", "1000.0")
+        )
+        self.pixel_insert_z_damping = float(
+            os.environ.get("AIC_PIXEL_INSERT_Z_DAMPING", "120.0")
+        )
+        self.pixel_insert_early_return_disabled = (
+            os.environ.get("AIC_PIXEL_INSERT_NO_EARLY_RETURN", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        if self.pixel_insert_enabled:
+            if self.visual_servo_model is None:
+                self.get_logger().warn(
+                    "AIC_PIXEL_INSERT_ENABLED=1 but no visual-servo model is loaded; "
+                    "pixel insert will stay inactive."
+                )
+            self.get_logger().warn(
+                "Pixel-gated insertion controller enabled: "
+                f"start={self.pixel_insert_start_s:.1f}s "
+                f"budget={self.pixel_insert_budget_s:.1f}s "
+                f"gate={self.pixel_insert_xy_gate_m * 1000:.1f}mm/"
+                f"{self.pixel_insert_stable_ticks}t "
+                f"xy_speed={self.pixel_insert_max_xy_speed_mps * 1000:.1f}mm/s "
+                f"descend_vz={self.pixel_insert_descend_vz_mps * 1000:.1f}mm/s "
+                f"insert_vz={self.pixel_insert_insert_vz_mps * 1000:.1f}mm/s "
+                f"contact_delta={self.pixel_insert_contact_delta_n:.1f}N "
+                f"complete_depth={self.pixel_insert_complete_depth_m * 1000:.1f}mm"
             )
 
         # Force-feedback final-descent state machine (T1.2 v2). On entry:
@@ -1183,6 +1260,15 @@ class RunACT(Policy):
         else:
             # Defensive reset in case a later checkpoint shrinks state again.
             self.current_task_vec = np.zeros(TASK_DIM, dtype=np.float32)
+        final_helper_allowed = (
+            not self.final_helper_plug_types
+            or task.plug_type in self.final_helper_plug_types
+        )
+        if not final_helper_allowed:
+            self.get_logger().info(
+                "Final-stage helpers disabled for this task "
+                f"(plug_type={task.plug_type})"
+            )
 
         # Wait up to 5 sim-seconds for the first observation.
         start_t = self.time_now()
@@ -1260,6 +1346,11 @@ class RunACT(Policy):
         force_descent_baseline_fz = None
         force_descent_vs_conf_streak = 0
         force_descent_zero_signs_streak = 0  # ticks of classifier signs == (0,0)
+        pixel_insert_state = "WAITING"
+        pixel_insert_started_at = None
+        pixel_insert_descend_started_at = None
+        pixel_insert_contact_z = None
+        pixel_insert_stable_count = 0
 
         while (self.time_now() - trial_start).nanoseconds * 1e-9 < self.max_trial_s:
             loop_start = self.time_now()
@@ -1440,6 +1531,7 @@ class RunACT(Policy):
                         )
                 if (
                     mode_label != "BACKOFF"
+                    and final_helper_allowed
                     and self.visual_servo_model is not None
                     and trial_elapsed_s >= self.visual_servo_start_s
                 ):
@@ -1592,12 +1684,147 @@ class RunACT(Policy):
                                     f" vs_xy_norm={xy_error_norm * 1000.0:.1f}mm"
                                 )
 
+                if (
+                    mode_label != "BACKOFF"
+                    and final_helper_allowed
+                    and self.pixel_insert_enabled
+                    and self.visual_servo_model is not None
+                    and trial_elapsed_s >= self.pixel_insert_start_s
+                ):
+                    if visual_servo_output_si is None:
+                        visual_servo_output_si = self._predict_visual_servo_output_si(
+                            observation_msg
+                        )
+                    if visual_servo_output_si is not None:
+                        if pixel_insert_started_at is None:
+                            pixel_insert_started_at = sim_now
+                            pixel_insert_state = "ALIGN"
+                            pixel_insert_stable_count = 0
+                            self.get_logger().warn(
+                                f"PIXEL_INSERT ALIGN start at t={trial_elapsed_s:.2f}s"
+                            )
+                        elapsed_pi_s = (sim_now - pixel_insert_started_at).nanoseconds * 1e-9
+                        if (
+                            elapsed_pi_s > self.pixel_insert_budget_s
+                            and pixel_insert_state
+                            not in {"COMPLETE", "YIELDED"}
+                        ):
+                            self.get_logger().warn(
+                                f"PIXEL_INSERT yielded after {elapsed_pi_s:.1f}s "
+                                f"in state={pixel_insert_state}"
+                            )
+                            pixel_insert_state = "YIELDED"
+
+                        if pixel_insert_state in {"ALIGN", "DESCEND"}:
+                            xy_error = visual_servo_output_si[:2] * self.visual_servo_xy_sign
+                            xy_error_norm = float(np.linalg.norm(xy_error))
+                            xy_cmd = xy_error * self.pixel_insert_xy_gain
+                            xy_cmd_norm = float(np.linalg.norm(xy_cmd))
+                            if xy_cmd_norm > self.pixel_insert_max_xy_speed_mps:
+                                xy_cmd *= self.pixel_insert_max_xy_speed_mps / xy_cmd_norm
+
+                            if xy_error_norm <= self.pixel_insert_xy_gate_m:
+                                pixel_insert_stable_count += 1
+                            else:
+                                pixel_insert_stable_count = 0
+
+                            action_used = action[:6].copy()
+                            action_used[0] = xy_cmd[0]
+                            action_used[1] = xy_cmd[1]
+                            action_used[2] = 0.0
+                            visual_servo_debug += (
+                                " pi_xy_mm="
+                                f"{np.round(xy_error * 1000.0, 1).tolist()}"
+                                f" pi_xy_norm={xy_error_norm * 1000.0:.1f}mm"
+                                f" pi_stable={pixel_insert_stable_count}"
+                            )
+
+                            if (
+                                pixel_insert_state == "ALIGN"
+                                and pixel_insert_stable_count
+                                >= self.pixel_insert_stable_ticks
+                            ):
+                                last_target_pose = observation_msg.controller_state.tcp_pose
+                                pixel_insert_descend_started_at = sim_now
+                                pixel_insert_state = "DESCEND"
+                                self.get_logger().warn(
+                                    "PIXEL_INSERT DESCEND start "
+                                    f"xy={xy_error_norm * 1000.0:.1f}mm "
+                                    "target reset to TCP"
+                                )
+
+                            if pixel_insert_state == "DESCEND":
+                                action_used[2] = self.pixel_insert_descend_vz_mps
+                                fmag_delta = force_mag - baseline_force
+                                t_descend = (
+                                    sim_now - pixel_insert_descend_started_at
+                                ).nanoseconds * 1e-9
+                                if fmag_delta > self.pixel_insert_contact_delta_n:
+                                    pixel_insert_contact_z = (
+                                        observation_msg.controller_state.tcp_pose.position.z
+                                    )
+                                    pixel_insert_state = "INSERT"
+                                    self.get_logger().warn(
+                                        "PIXEL_INSERT CONTACT "
+                                        f"t_descend={t_descend:.2f}s "
+                                        f"fmag_delta={fmag_delta:.2f}N "
+                                        f"z={pixel_insert_contact_z:.4f}"
+                                    )
+                                elif fmag_delta > self.pixel_insert_max_force_delta_n:
+                                    self.get_logger().warn(
+                                        "PIXEL_INSERT abort DESCEND: "
+                                        f"fmag_delta={fmag_delta:.1f}N"
+                                    )
+                                    pixel_insert_state = "YIELDED"
+                                elif t_descend >= self.pixel_insert_descend_max_s:
+                                    self.get_logger().warn(
+                                        "PIXEL_INSERT DESCEND timeout "
+                                        f"t={t_descend:.2f}s "
+                                        f"fmag_delta={fmag_delta:.2f}N"
+                                    )
+                                    pixel_insert_state = "YIELDED"
+                            mode_label = f"PI_{pixel_insert_state}"
+
+                        elif pixel_insert_state == "INSERT":
+                            action_used = action[:6].copy()
+                            action_used[0] = 0.0
+                            action_used[1] = 0.0
+                            action_used[2] = self.pixel_insert_insert_vz_mps
+                            curr_z = observation_msg.controller_state.tcp_pose.position.z
+                            depth_m = abs(pixel_insert_contact_z - curr_z)
+                            fmag_delta = force_mag - baseline_force
+                            if depth_m >= self.pixel_insert_complete_depth_m:
+                                pixel_insert_state = "COMPLETE"
+                                self.get_logger().warn(
+                                    f"PIXEL_INSERT COMPLETE depth={depth_m * 1000:.1f}mm "
+                                    f"fmag_delta={fmag_delta:.2f}N"
+                                )
+                            elif fmag_delta > self.pixel_insert_max_force_delta_n:
+                                self.get_logger().warn(
+                                    "PIXEL_INSERT abort INSERT: "
+                                    f"fmag_delta={fmag_delta:.1f}N "
+                                    f"depth={depth_m * 1000:.1f}mm"
+                                )
+                                pixel_insert_state = "YIELDED"
+                            mode_label = f"PI_{pixel_insert_state}"
+
+                        elif pixel_insert_state == "COMPLETE":
+                            action_used = np.zeros(6, dtype=np.float64)
+                            mode_label = "PI_COMPLETE"
+                            if not self.pixel_insert_early_return_disabled:
+                                self.get_logger().warn(
+                                    "PIXEL_INSERT COMPLETE — returning early "
+                                    f"at t={trial_elapsed_s:.1f}s"
+                                )
+                                return True
+
                 # T1.2 Force-feedback final-descent state machine. Sequenced
                 # AFTER visual-servo assist so xy alignment has had time to
                 # settle, but BEFORE final_search so it can take priority when
                 # both are enabled.
                 if (
                     mode_label != "BACKOFF"
+                    and not mode_label.startswith("PI_")
                     and self.force_descent_enabled
                     and trial_elapsed_s >= self.force_descent_start_s
                 ):
@@ -1817,6 +2044,7 @@ class RunACT(Policy):
                 if (
                     mode_label != "BACKOFF"
                     and not mode_label.startswith("FD_")
+                    and not mode_label.startswith("PI_")
                     and self.final_search_enabled
                     and trial_elapsed_s >= self.final_search_start_s
                 ):
@@ -1897,6 +2125,27 @@ class RunACT(Policy):
                             50.0,
                             50.0,
                             self.force_descent_z_damping,
+                            20.0,
+                            20.0,
+                            20.0,
+                        ],
+                    )
+                elif mode_label in ("PI_DESCEND", "PI_INSERT"):
+                    self.set_pose_target(
+                        move_robot=move_robot,
+                        pose=clamped_target,
+                        stiffness=[
+                            90.0,
+                            90.0,
+                            self.pixel_insert_z_stiffness,
+                            50.0,
+                            50.0,
+                            50.0,
+                        ],
+                        damping=[
+                            50.0,
+                            50.0,
+                            self.pixel_insert_z_damping,
                             20.0,
                             20.0,
                             20.0,
